@@ -1,0 +1,25 @@
+{
+  "name": "nostrwolfe-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone daemon mirroring the NostrWolfe public marketplace (kind:38400) into a Buzz community Services channel.",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "start": "node --env-file=.env dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "nostr-tools": "^2.10.4",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
