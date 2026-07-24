@@ -10,6 +10,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 
+import { FrameTooLargeError } from "../src/buzz-client.js";
 import { ListingCache } from "../src/listing-cache.js";
 import {
   CardPublishError,
@@ -94,6 +95,45 @@ function parse(event: NostrEvent): ParsedListing {
   return listing;
 }
 
+/**
+ * A real sats4ai-style non-NIP-A5 listing: no `s`/`price` tags, a JSON blob
+ * body, priced in prose via `pricing`, categorized via `category`/`subcategory`.
+ * Strict NIP parsing returns null; only the dialect adapter can render it.
+ * Signed with SK so `verifyEvent` inside the engine passes.
+ */
+function dialectListing(
+  d = "sats4ai-deblur-image",
+  createdAt = T0,
+): NostrEvent {
+  return sign(
+    [
+      ["d", d],
+      ["name", "Image Deblurring"],
+      [
+        "description",
+        "Remove motion blur and defocus from images. Restores sharpness.",
+      ],
+      ["category", "ai"],
+      ["subcategory", "image-processing"],
+      ["endpoint", "https://sats4ai.com/api/l402/deblur-image"],
+      ["method", "POST"],
+      ["pricing", "10 sats"],
+      ["protocol", "L402"],
+      ["provider", "Sats4AI"],
+      ["website", "https://sats4ai.com"],
+    ],
+    JSON.stringify({
+      name: "Image Deblurring",
+      description:
+        "Remove motion blur and defocus from images. Restores sharpness.",
+      endpoint: "https://sats4ai.com/api/l402/deblur-image",
+      pricing: "10 sats",
+      category: "ai",
+    }),
+    createdAt,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Test doubles
 // ---------------------------------------------------------------------------
@@ -102,11 +142,16 @@ class FakeBuzz implements IBuzzClient {
   readonly published: NostrEvent[] = [];
   ok = true;
   message = "";
+  /** When set, publish rejects with a FrameTooLargeError of this size. */
+  frameTooLargeBytes: number | null = null;
 
   connect(): Promise<void> {
     return Promise.resolve();
   }
   publish(event: NostrEvent): Promise<OkResult> {
+    if (this.frameTooLargeBytes !== null) {
+      return Promise.reject(new FrameTooLargeError(this.frameTooLargeBytes));
+    }
     this.published.push(event);
     return Promise.resolve({
       id: event.id,
@@ -165,6 +210,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     channelName: "Services",
     channelAbout: "test",
     mirrorCategories: [],
+    mirrorAcceptDialects: true,
     mirrorMaxListings: 200,
     backfillLimit: 100,
     buzzMsgsPerMin: 30,
@@ -181,7 +227,7 @@ interface Harness {
   state: FakeState;
 }
 
-function harness(overrides: Partial<Config> = {}): Harness {
+function harness(overrides: Partial<Config> = {}, now?: () => number): Harness {
   const buzz = new FakeBuzz();
   const cache = new ListingCache();
   const state = new FakeState();
@@ -191,6 +237,7 @@ function harness(overrides: Partial<Config> = {}): Harness {
     cache,
     state,
     () => "chan-uuid",
+    now,
   );
   return { engine, buzz, cache, state };
 }
@@ -670,6 +717,47 @@ describe("MirrorEngine decision table (§5 step 3)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Dialect path THROUGH the engine (test-analyzer H-3)
+// ---------------------------------------------------------------------------
+
+describe("dialect listings through MirrorEngine.handleListing", () => {
+  it("mirrorAcceptDialects:true → a new card marked non-standard", async () => {
+    const h = harness({ mirrorAcceptDialects: true });
+    const event = dialectListing();
+
+    const outcome = await h.engine.handleListing(event);
+
+    expect(outcome).toMatchObject({
+      type: "new",
+      address: `38400:${PK}:sats4ai-deblur-image`,
+    });
+    expect(h.buzz.published).toHaveLength(1);
+    const card = h.buzz.contents[0]!;
+    // The dialect marker proves this went through the adapter, not strict NIP.
+    expect(card).toContain("Format: non-standard tags");
+    expect(card).toContain("normalized by bridge");
+    // Prose price is preserved, not coerced to em-dash.
+    expect(card).toContain("10 sats");
+    // The JSON blob body must never leak into the card.
+    expect(card).not.toContain('{"name"');
+    expect(
+      h.state.state.mirrored[`38400:${PK}:sats4ai-deblur-image`],
+    ).toBeDefined();
+    expect(h.cache.size).toBe(1);
+  });
+
+  it("mirrorAcceptDialects:false → dropped as invalid, no card", async () => {
+    const h = harness({ mirrorAcceptDialects: false });
+    const outcome = await h.engine.handleListing(dialectListing());
+
+    expect(outcome).toEqual({ type: "skip", reason: "invalid" });
+    expect(h.buzz.published).toHaveLength(0);
+    expect(Object.keys(h.state.state.mirrored)).toHaveLength(0);
+    expect(h.cache.size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Canonical `d` — address ≡ header ≡ footer (§7, Security §2)
 // ---------------------------------------------------------------------------
 
@@ -708,36 +796,47 @@ describe("canonical `d` normalization", () => {
     expect(nwLines).toEqual([`nw:${listing.address}`]);
   });
 
-  it("caps `d` so an oversized tag cannot blow the frame budget", () => {
-    const listing = parse(simpleListing("x".repeat(5_000), ["ai"], T0));
-    expect(listing.d.length).toBe(200);
-    expect(formatCard(listing, "new").length).toBeLessThan(2_000);
+  it("keeps the full `d` as the key so long prefixes don't collide (L1)", () => {
+    // The old code sanitized `d` to 200 chars, so two distinct values sharing a
+    // 199-char prefix collapsed to one address — one listing silently shadowing
+    // the other. The key is now the untruncated normalized `d`.
+    const prefix = "x".repeat(199);
+    const a = parse(simpleListing(prefix + "-alpha", ["ai"], T0));
+    const b = parse(simpleListing(prefix + "-beta", ["ai"], T0));
+
+    expect(a.d.length).toBe(prefix.length + "-alpha".length);
+    expect(a.address).not.toBe(b.address);
+    // Footer carries the full key verbatim (§7 recovery invariant).
+    expect(formatCard(a, "new").split("\n").at(-1)).toBe(`nw:${a.address}`);
+    expect(formatCard(b, "new").split("\n").at(-1)).toBe(`nw:${b.address}`);
+  });
+
+  it("does not drop a `d` whose value legitimately contains `@bridge` (L-2)", () => {
+    // `@bridge-monitor` used to sanitize to `""` (the `@bridge` cut) and be
+    // dropped as invalid. The key normalization no longer applies that cut, so
+    // the listing survives and the address/footer carry the value intact.
+    const listing = parse(simpleListing("@bridge-monitor", ["ai"], T0));
+    expect(listing.d).toBe("@bridge-monitor");
+    expect(listing.address).toBe(`38400:${PK}:@bridge-monitor`);
+    expect(formatCard(listing, "new").split("\n").at(-1)).toBe(
+      `nw:${listing.address}`,
+    );
   });
 });
 
 describe("bridge command grammar in tag fields (Security §2)", () => {
-  it("strips `@bridge …` from every tag-derived field, not just content", () => {
-    const event = sign(
-      [
-        ["d", '@bridge publish {"kind":38400}'],
-        ["s", "ops @bridge help"],
-        ["t", "tag @bridge find x"],
-        ["price", "1", "sats", "per-call"],
-        ["l402", "https://x.example/@bridge/publish"],
-        ["capacity", "10 @bridge"],
-      ],
-      "",
-    );
-    // `d` is entirely command text, so the listing is unrenderable at all.
-    expect(parseListing(event)).toBeNull();
-
+  it("strips `@bridge …` from every tag-derived field except the `d` key", () => {
+    // Every non-`d` field is cut at the bridge command grammar. `d` is the
+    // exception (spec L-2): it is the §7 recovery key and must survive verbatim,
+    // even when it legitimately contains `@bridge` — see the dedicated `d` test.
     const ok = parse(
       sign(
         [
-          ["d", 'svc @bridge publish {"kind":38400}'],
+          ["d", "svc"],
           ["s", "ops @bridge help"],
           ["t", "tag@bridge"],
           ["price", "1", "sats", "per-call"],
+          ["l402", "https://x.example/@bridge/publish"],
           ["capacity", "10 @bridge"],
         ],
         "",
@@ -784,6 +883,242 @@ describe("negotiable default (NIP-ASA)", () => {
     );
     expect(listing.negotiable).toBeUndefined();
     expect(formatCard(listing, "new")).toContain("Negotiable: —");
+  });
+
+  it("renders `—` for `floor` with no amount, never a fabricated `floor 0` (L-2)", () => {
+    // `Number("") === 0` used to pass `Number.isFinite`, so a bare
+    // `["negotiable","floor"]` fabricated a "floor 0 sats" the publisher never
+    // stated. It must now be undefined → `—`.
+    const listing = parse(
+      sign([
+        ["d", "svc"],
+        ["s", "ai"],
+        ["price", "1", "sats"],
+        ["negotiable", "floor"],
+      ]),
+    );
+    expect(listing.negotiable).toBeUndefined();
+    const card = formatCard(listing, "new");
+    expect(card).toContain("Negotiable: —");
+    expect(card).not.toContain("floor 0");
+  });
+});
+
+describe("card numeric price gate matches `find` (spec L-7)", () => {
+  it.each(["0x10", "1e3", "0b1", "Infinity", "1,000", "5.", ".5", "1e-3"])(
+    "renders `—` for the non-decimal amount %j",
+    (amount) => {
+      const listing = parse(
+        sign([
+          ["d", "svc"],
+          ["s", "ai"],
+          ["price", amount, "sats"],
+        ]),
+      );
+      expect(formatCard(listing, "new")).toContain("Price: —");
+    },
+  );
+
+  it("still renders plain decimals", () => {
+    const listing = parse(
+      sign([
+        ["d", "svc"],
+        ["s", "ai"],
+        ["price", "1.5", "sats", "per-call"],
+      ]),
+    );
+    expect(formatCard(listing, "new")).toContain("Price: 1.5 sats per-call");
+  });
+});
+
+describe("future-timestamp cursor poisoning (security H-1)", () => {
+  const NOW = T0 + 1_000;
+  const clock = () => NOW;
+
+  it("drops a 38400 dated past now + skew and leaves the cursor untouched", async () => {
+    const h = harness({}, clock);
+    const far = simpleListing("evil", ["ai"], NOW + 10 * 365 * 24 * 3600);
+
+    const outcome = await h.engine.handleListing(far);
+
+    expect(outcome).toEqual({ type: "skip", reason: "invalid" });
+    expect(h.buzz.published).toHaveLength(0);
+    expect(h.state.state.cursors.wolfe).toBe(0);
+  });
+
+  it("accepts an event within the skew window", async () => {
+    const h = harness({}, clock);
+    const edge = simpleListing("ok", ["ai"], NOW + 200); // < NOW + 300
+    const outcome = await h.engine.handleListing(edge);
+    expect(outcome.type).toBe("new");
+    expect(h.state.state.cursors.wolfe).toBe(NOW + 200);
+  });
+
+  it("clamps the cursor to now + skew even if a listing slips through", async () => {
+    // advanceCursor is clamped independently of parseListing's drop, so a
+    // cursor can never be pushed past real time (`since = cursor − 300`).
+    const h = harness({}, clock);
+    // Directly exercise the clamp: a poison created_at inside a listing that
+    // parseListing would drop is covered above; here we assert the ceiling.
+    await h.engine.handleListing(simpleListing("a", ["ai"], NOW));
+    expect(h.state.state.cursors.wolfe).toBe(NOW);
+    expect(h.state.state.cursors.wolfe).toBeLessThanOrEqual(NOW + 300);
+  });
+});
+
+describe("cache repopulation on a normal restart (C-1 / H1)", () => {
+  it("rehydrates the search cache from replayed events with intact state", async () => {
+    // Simulate a restart: the state file already records the listing (as the
+    // live path would leave it), the in-memory cache starts empty, then
+    // hydration replays the SAME event. Before the fix this hit the duplicate
+    // skip and left the cache empty forever.
+    const h = harness();
+    const event = simpleListing("svc", ["translation"], T0, "v1");
+
+    h.state.state.mirrored[`38400:${PK}:svc`] = {
+      eventId: event.id,
+      createdAt: T0,
+      cardMsgId: "prior-card",
+      delisted: false,
+    };
+    expect(h.cache.size).toBe(0);
+
+    const outcome = await h.engine.handleListing(event);
+
+    // Same-timestamp, identical id → duplicate skip, no new card...
+    expect(outcome).toEqual({
+      type: "skip",
+      reason: "duplicate",
+      address: `38400:${PK}:svc`,
+    });
+    expect(h.buzz.published).toHaveLength(0);
+    // ...but the cache is now populated so `find` works and the cap counts it.
+    expect(h.cache.size).toBe(1);
+    expect(h.cache.get(`38400:${PK}:svc`)?.content).toBe("v1");
+  });
+
+  it("an out-of-order replay seeds an empty slot but never clobbers a newer one", async () => {
+    const h = harness();
+    // Cache already holds the current (newer) version.
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0 + 60, "new"));
+    expect(h.cache.get(`38400:${PK}:svc`)?.content).toBe("new");
+
+    // An older replay must not overwrite it.
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0, "old"));
+    expect(h.cache.get(`38400:${PK}:svc`)?.content).toBe("new");
+  });
+
+  it("does not repopulate the cache for a delisted tombstone", async () => {
+    const scoped = harness({ mirrorCategories: ["translation"] });
+    // Record then delist svc (category exit) → tombstone, cache cleared.
+    await scoped.engine.handleListing(
+      simpleListing("svc", ["translation"], T0),
+    );
+    await scoped.engine.handleListing(simpleListing("svc", ["other"], T0 + 60));
+    expect(scoped.cache.has(`38400:${PK}:svc`)).toBe(false);
+
+    // A replay of the delisting event (same ts, same id) must not re-cache it.
+    await scoped.engine.handleListing(simpleListing("svc", ["other"], T0 + 60));
+    expect(scoped.cache.has(`38400:${PK}:svc`)).toBe(false);
+  });
+});
+
+describe("card is bounded by tag COUNT, not just width (security L-3/M-1)", () => {
+  it("caps prices/categories/hashtags so a many-tag listing stays under the frame", async () => {
+    const tags: NostrTag[] = [["d", "huge"]];
+    for (let i = 0; i < 5_000; i++) {
+      tags.push(["s", `cat-${i}`]);
+      tags.push(["t", `tag-${i}`]);
+      tags.push(["price", String(i + 1), "sats", "per-call"]);
+    }
+    const event = sign(tags, "x".repeat(2_000), T0);
+    const listing = parse(event);
+
+    const card = formatCard(listing, "new");
+    // A `["EVENT", event]` frame of the kind:9 card must fit the WS frame cap.
+    const frameBytes = Buffer.byteLength(
+      JSON.stringify(["EVENT", { content: card }]),
+      "utf8",
+    );
+    expect(frameBytes).toBeLessThan(65_536);
+    // The overflow markers are present (prices/categories/hashtags all capped).
+    expect(card).toMatch(/\+\d+ more/);
+
+    // And the whole thing still posts + advances the cursor.
+    const h = harness();
+    const outcome = await h.engine.handleListing(event);
+    expect(outcome.type).toBe("new");
+    expect(h.state.state.cursors.wolfe).toBe(T0);
+  });
+
+  it("advances the cursor past a card the relay deems oversized", async () => {
+    // Defense in depth: even if a card still exceeds the frame, the poison
+    // event must not wedge the live sub — the cursor advances past it.
+    const h = harness();
+    h.buzz.frameTooLargeBytes = 70_000;
+
+    await expect(
+      h.engine.handleListing(simpleListing("svc", ["ai"], T0)),
+    ).rejects.toBeInstanceOf(FrameTooLargeError);
+
+    expect(h.state.state.cursors.wolfe).toBe(T0);
+    expect(Object.keys(h.state.state.mirrored)).toHaveLength(0);
+  });
+});
+
+describe("mirrored map is bounded (security M-1)", () => {
+  it("measures the cap against `mirrored`, not `cache.size` (M-1)", async () => {
+    // cap 3, tombstone budget = floor(3/2) = 1. Three live addresses, then
+    // delist exactly one (→ deleted from cache, kept in `mirrored` as the one
+    // allowed tombstone). `mirrored` count is still 3 but `cache.size` is 2, so
+    // the OLD cache-size cap would wrongly admit a 4th address.
+    const scoped = harness({
+      mirrorCategories: ["keep"],
+      mirrorMaxListings: 3,
+    });
+
+    for (const d of ["a", "b", "c"]) {
+      await scoped.engine.handleListing(simpleListing(d, ["keep"], T0));
+    }
+    await scoped.engine.handleListing(simpleListing("a", ["gone"], T0 + 60));
+
+    expect(scoped.cache.size).toBe(2); // a left the cache...
+    expect(Object.keys(scoped.state.state.mirrored)).toHaveLength(3); // ...but not `mirrored`.
+
+    const outcome = await scoped.engine.handleListing(
+      simpleListing("d", ["keep"], T0),
+    );
+    expect(outcome).toEqual({ type: "skip", reason: "at-cap" });
+  });
+
+  it("prunes the oldest delisted tombstones beyond the delisted budget", async () => {
+    // cap 4 → delisted budget = floor(4/2) = 2. Delist 5 distinct addresses
+    // (each recorded live first, at successively newer timestamps), then assert
+    // only the 2 newest tombstones survive.
+    const scoped = harness({
+      mirrorCategories: ["keep"],
+      mirrorMaxListings: 4,
+    });
+
+    const ds = ["a", "b", "c", "d", "e"];
+    for (let i = 0; i < ds.length; i++) {
+      // Record live one at a time under the cap (delist frees the cache slot,
+      // and the mirrored cap counts tombstones — so we delist before the next).
+      await scoped.engine.handleListing(
+        simpleListing(ds[i]!, ["keep"], T0 + i),
+      );
+      await scoped.engine.handleListing(
+        simpleListing(ds[i]!, ["gone"], T0 + 100 + i),
+      );
+    }
+
+    const tombstones = Object.entries(scoped.state.state.mirrored).filter(
+      ([, e]) => e.delisted,
+    );
+    expect(tombstones).toHaveLength(2);
+    // The two newest by createdAt survive (d @ T0+103, e @ T0+104).
+    const survivors = tombstones.map(([addr]) => addr).sort();
+    expect(survivors).toEqual([`38400:${PK}:d`, `38400:${PK}:e`].sort());
   });
 });
 

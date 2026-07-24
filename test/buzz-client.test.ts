@@ -6,6 +6,8 @@
  * exact OK/CLOSED strings from the spec table.
  */
 
+import { EventEmitter } from "node:events";
+
 import {
   finalizeEvent,
   generateSecretKey,
@@ -18,11 +20,16 @@ import {
   BuzzFatalError,
   FrameTooLargeError,
   MAX_FRAME_BYTES,
+  MAX_PUBLISH_SENDS,
+  PublishRetriesExhaustedError,
   TokenBucket,
+  isNostrEvent,
   parseRetryInSeconds,
+  startHeartbeat,
   type BuzzClientOptions,
   type Logger,
 } from "../src/buzz-client.js";
+import type { WebSocket } from "ws";
 import type {
   BridgeIdentity,
   Config,
@@ -31,6 +38,7 @@ import type {
 } from "../src/types.js";
 import {
   BuzzMockRelay,
+  NO_ACK,
   OK_MESSAGES,
   rateLimitedRetryIn,
   waitUntil,
@@ -691,5 +699,256 @@ describe("TokenBucket", () => {
     // The 7th send must wait on the minute bucket (~10s at 6/min), not the burst.
     const wait = bucket.tryConsume();
     expect(wait).toBeGreaterThan(5_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Head-of-line retry cap (H-5)
+// ---------------------------------------------------------------------------
+
+describe("publish send cap (H-5)", () => {
+  it("drops a publish the relay never ACKs after MAX_PUBLISH_SENDS and unblocks the queue behind it", async () => {
+    const { mock, client, identity, logger } = await setup(
+      {},
+      { okTimeoutMs: 25 },
+    );
+    await client.connect();
+
+    const stuck = makeChatEvent(identity, "never-acked");
+    const behind = makeChatEvent(identity, "queued-behind");
+    // The relay accepts `stuck` but never sends its OK; `behind` is normal.
+    mock.onEvent((e) => (e.id === stuck.id ? NO_ACK : undefined));
+
+    const stuckResult = client.publish(stuck).catch((e: unknown) => e);
+    const behindResult = client.publish(behind);
+
+    const err = await stuckResult;
+    expect(err).toBeInstanceOf(PublishRetriesExhaustedError);
+    expect((err as PublishRetriesExhaustedError).sends).toBe(MAX_PUBLISH_SENDS);
+    // Exactly MAX_PUBLISH_SENDS attempts hit the wire, no more.
+    expect(mock.sendCount(stuck.id)).toBe(MAX_PUBLISH_SENDS);
+
+    // The event queued behind the wedged one still completes.
+    const ok = await behindResult;
+    expect(ok.ok).toBe(true);
+    expect(mock.sendCount(behind.id)).toBe(1);
+
+    const dropLog = logger.records.find(
+      (r) =>
+        r.level === "error" &&
+        r.msg.includes("publish dropped after exhausting resends"),
+    );
+    expect(dropLog).toBeDefined();
+    expect(dropLog?.fields["queueLength"]).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Channel-join tri-state on CLOSED (H-3)
+// ---------------------------------------------------------------------------
+
+describe("onNotChannelMember tri-state (H-3)", () => {
+  it("keeps the subscription alive and does NOT go fatal when the join is unavailable", async () => {
+    let joins = 0;
+    let fatal = false;
+    const { mock, client } = await setup(
+      {},
+      {
+        hooks: {
+          onNotChannelMember: async () => {
+            joins++;
+            return "unavailable";
+          },
+        },
+      },
+    );
+    client.on("fatal", () => {
+      fatal = true;
+    });
+    await client.connect();
+    mock.scriptClosed("ch-flap", OK_MESSAGES.RESTRICTED_NOT_CHANNEL_MEMBER);
+
+    client.subscribe("ch-flap", [{ kinds: [9], "#h": [CHANNEL] }], () => {});
+
+    await waitUntil(() => joins === 1, 5_000);
+    // Give any (incorrect) fatal path a chance to run.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(fatal).toBe(false);
+    expect(client.authenticated).toBe(true);
+  });
+
+  it("goes fatal when the join is genuinely rejected", async () => {
+    let fatal: BuzzFatalError | null = null;
+    const { mock, client } = await setup(
+      {},
+      {
+        hooks: {
+          onNotChannelMember: async () => "rejected",
+          onFatal: (err) => {
+            fatal = err;
+          },
+        },
+      },
+    );
+    await client.connect();
+    mock.scriptClosed("ch-no", OK_MESSAGES.RESTRICTED_NOT_CHANNEL_MEMBER);
+
+    client.subscribe("ch-no", [{ kinds: [9], "#h": [CHANNEL] }], () => {});
+
+    await waitUntil(() => fatal !== null, 5_000);
+    expect(fatal).toBeInstanceOf(BuzzFatalError);
+    expect((fatal as unknown as BuzzFatalError).guidance).toMatch(
+      /channel membership/i,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pump resilience (M-5)
+// ---------------------------------------------------------------------------
+
+describe("pump iteration resilience (M-5)", () => {
+  it("settles the in-flight item and keeps pumping when an emit listener throws", async () => {
+    const { mock, client, identity, logger } = await setup();
+    await client.connect();
+
+    // A channelLost listener that throws synchronously from inside the pump's
+    // own stack (handleOkFailure → emit) used to escape as an unhandled
+    // rejection and strand the item; now it is caught and the item rejected.
+    client.on("channelLost", () => {
+      throw new Error("listener boom");
+    });
+    mock.scriptOk({
+      ok: false,
+      message: OK_MESSAGES.INVALID_CHANNEL_NOT_FOUND,
+    });
+
+    const err = await client
+      .publish(makeChatEvent(identity, "boom"))
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe("listener boom");
+    expect(
+      logger.records.some(
+        (r) =>
+          r.level === "error" && r.msg.includes("publish pump iteration threw"),
+      ),
+    ).toBe(true);
+
+    // The pump survived: a subsequent publish still goes through.
+    const ok = await client.publish(makeChatEvent(identity, "after"));
+    expect(ok.ok).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Inbound event admission (L-5)
+// ---------------------------------------------------------------------------
+
+describe("isNostrEvent created_at guard (L-5)", () => {
+  const base = {
+    id: "a".repeat(64),
+    pubkey: "b".repeat(64),
+    kind: 9,
+    content: "",
+    sig: "s".repeat(128),
+    tags: [] as string[][],
+  };
+
+  it("accepts an event with a finite created_at", () => {
+    expect(isNostrEvent({ ...base, created_at: 1_753_280_000 })).toBe(true);
+  });
+
+  it("rejects a missing, NaN, or non-number created_at", () => {
+    expect(isNostrEvent(base)).toBe(false);
+    expect(isNostrEvent({ ...base, created_at: Number.NaN })).toBe(false);
+    expect(isNostrEvent({ ...base, created_at: Infinity })).toBe(false);
+    expect(isNostrEvent({ ...base, created_at: "1753280000" })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Keepalive / half-open watchdog (H-1)
+// ---------------------------------------------------------------------------
+
+describe("startHeartbeat (H-1)", () => {
+  function fakeSocket(): WebSocket & { pings: number } {
+    const emitter = new EventEmitter() as unknown as WebSocket & {
+      pings: number;
+      readyState: number;
+      ping: () => void;
+    };
+    emitter.readyState = 1; // WebSocket.OPEN
+    emitter.pings = 0;
+    emitter.ping = () => {
+      emitter.pings += 1;
+    };
+    return emitter;
+  }
+
+  it("invokes onDead when no pong arrives before the deadline", async () => {
+    const ws = fakeSocket();
+    let dead = 0;
+    const stop = startHeartbeat(ws, {
+      intervalMs: 10,
+      timeoutMs: 20,
+      onDead: () => {
+        dead += 1;
+      },
+    });
+    await waitUntil(() => dead === 1, 1_000);
+    expect(ws.pings).toBeGreaterThanOrEqual(1);
+    stop();
+  });
+
+  it("resets the deadline on each pong and never fires while the socket answers", async () => {
+    const ws = fakeSocket();
+    ws.ping = () => {
+      ws.pings += 1;
+      setImmediate(() => ws.emit("pong"));
+    };
+    let dead = 0;
+    const stop = startHeartbeat(ws, {
+      intervalMs: 10,
+      timeoutMs: 40,
+      onDead: () => {
+        dead += 1;
+      },
+    });
+    await new Promise((r) => setTimeout(r, 120));
+    expect(ws.pings).toBeGreaterThan(1);
+    expect(dead).toBe(0);
+    stop();
+  });
+
+  it("stop() halts further pings", async () => {
+    const ws = fakeSocket();
+    const stop = startHeartbeat(ws, {
+      intervalMs: 10,
+      timeoutMs: 20,
+      onDead: () => {},
+    });
+    await waitUntil(() => ws.pings >= 1, 1_000);
+    stop();
+    const after = ws.pings;
+    await new Promise((r) => setTimeout(r, 40));
+    expect(ws.pings).toBe(after);
+  });
+
+  it("terminates a half-open buzz socket and reconnects when a pong is missed", async () => {
+    const { mock, client, logger } = await setup(
+      { autoPong: false },
+      { pingIntervalMs: 20, pongTimeoutMs: 30 },
+    );
+    await client.connect();
+
+    // The relay never pongs, so the watchdog drops the socket; the normal
+    // reconnect path then opens a fresh connection.
+    await waitUntil(() => mock.connections.length >= 2, 5_000);
+    expect(
+      logger.records.some(
+        (r) => r.level === "error" && r.msg.includes("missed pong"),
+      ),
+    ).toBe(true);
   });
 });

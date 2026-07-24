@@ -36,6 +36,7 @@ import type {
   BridgeIdentity,
   Config,
   LogLevel,
+  MirroredMap,
   NostrEvent,
   Subscription,
 } from "./types.js";
@@ -49,6 +50,32 @@ const KIND_JOIN_REQUEST = 9021;
 /** Backoff for retrying a failed ChannelManager re-run (§3, error matrix). */
 const CHANNEL_RERUN_BASE_DELAY_MS = 1_000;
 const CHANNEL_RERUN_MAX_DELAY_MS = 60_000;
+
+/**
+ * Hard ceiling on a single ChannelManager re-run before it is treated as hung
+ * (finding H-6/M-4). ChannelManager memoizes an in-flight run and also caps it,
+ * but the re-run ladder here needs its own guard: without it a run that never
+ * settles never reaches the retry `catch`, so `channelId` stays null forever and
+ * every card/reply throws "Services channel is not resolved yet". Racing the run
+ * against this timeout turns a hang into a rejection the ladder retries.
+ */
+const CHANNEL_RERUN_TIMEOUT_MS = 150_000;
+
+/** Operator-visible heartbeat cadence (finding H-1): one status line every 5 min. */
+const HEARTBEAT_INTERVAL_MS = 5 * 60_000;
+
+/**
+ * Thrown by the `channelId()` accessor while the Services channel is unresolved
+ * (finding H-6/M-4). A distinct type lets `onListing` log the null-channel drop
+ * with its own message and a running count instead of burying it under the
+ * generic "listing handling failed" error.
+ */
+export class ChannelUnresolvedError extends Error {
+  constructor() {
+    super("Services channel is not resolved yet");
+    this.name = "ChannelUnresolvedError";
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Logging — plain stdout JSON lines, pino-style levels (spec §1 `LOG_LEVEL`)
@@ -85,6 +112,55 @@ export function createLogger(level: LogLevel, component = "bridge"): Logger {
     warn: (m, f) => emit("warn", m, f),
     error: (m, f) => emit("error", m, f),
   };
+}
+
+/**
+ * Structured footer-recovery result (finding H-7). The mirror-engine owner is
+ * changing `recoverMirroredFromChannel` to return this so a scan that hit the
+ * page cap can be flagged; {@link normalizeRecovery} accepts both this and the
+ * legacy plain-map return so index.ts stays correct whichever shipped first.
+ */
+interface RecoveryResult {
+  mirrored: MirroredMap;
+  truncated: boolean;
+  pages?: number;
+}
+
+function isRecoveryResult(value: unknown): value is RecoveryResult {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "mirrored" in value &&
+    "truncated" in value
+  );
+}
+
+/** Accept either the structured result or the legacy `MirroredMap` (finding H-7). */
+export function normalizeRecovery(value: unknown): RecoveryResult {
+  if (isRecoveryResult(value)) return value;
+  return { mirrored: (value ?? {}) as MirroredMap, truncated: false };
+}
+
+/**
+ * Race `promise` against a deadline, rejecting with a descriptive error if it
+ * does not settle in time (finding H-6/M-4). The timer is unref'd so it never
+ * keeps an idle process alive, and cleared as soon as either side wins.
+ */
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${String(Math.round(ms))}ms`));
+    }, ms);
+    if (typeof timer.unref === "function") timer.unref();
+  });
+  return Promise.race([promise, deadline]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  }) as Promise<T>;
 }
 
 // ---------------------------------------------------------------------------
@@ -156,8 +232,24 @@ export async function startBridge(
       ? {}
       : { debounceMs: options.stateDebounceMs }),
     onWarn: (warning) => {
+      const { event, message, ...extra } = warning;
+      // A write failure is a durability alarm, not a discarded document: log it
+      // at error and do NOT trip `stateReset` — footer recovery is only for a
+      // state file that was thrown away (corrupt / community mismatch). Tripping
+      // it on every transient write failure would kick off a spurious ~100-query
+      // footer-recovery scan on an otherwise healthy channel (finding M-3).
+      if (event === "write-failed") {
+        log.error(message, { event, ...extra });
+        return;
+      }
       stateReset = true;
-      log.warn(warning.message, { event: warning.event });
+      log.warn(message, { event, ...extra });
+    },
+    onFatal: (error) => {
+      log.error("state store durability failure; going fatal", {
+        error: error.message,
+      });
+      options.onFatal?.(error);
     },
   });
   await state.load(config.buzzRelayUrl);
@@ -184,9 +276,14 @@ export async function startBridge(
 
   const channelId = (): string => {
     const id = state.getState().channelId;
-    if (id === null) throw new Error("Services channel is not resolved yet");
+    if (id === null) throw new ChannelUnresolvedError();
     return id;
   };
+
+  /** 38400s dropped because the Services channel was unresolved (finding H-6/M-4). */
+  let nullChannelDrops = 0;
+  /** Wall-clock ms of the last 38400 seen from wolfe; 0 until the first (finding H-1). */
+  let lastListingAt = 0;
 
   /**
    * (Re)open the mentions subscription (§6, flow #7). `since` is supplied as a
@@ -222,7 +319,11 @@ export async function startBridge(
     rerun = rerun.then(async () => {
       if (stopped) return;
       try {
-        const id = await run();
+        const id = await withTimeout(
+          run(),
+          CHANNEL_RERUN_TIMEOUT_MS * (options.timeScale ?? 1),
+          `ChannelManager re-run (${reason})`,
+        );
         log.info("ChannelManager re-run complete", { reason, channelId: id });
         ensureMentionsSubscription();
       } catch (err) {
@@ -288,20 +389,22 @@ export async function startBridge(
         },
         identity.secretKey,
       ) as unknown as NostrEvent;
-      try {
-        const ok = await buzz.publishNow(join);
-        if (ok.ok || ok.message.startsWith("duplicate:")) {
-          log.info("kind:9021 join accepted after membership rejection", {
-            channelId: id,
-          });
-          return true;
-        }
-        log.warn("kind:9021 join rejected", { message: ok.message });
-        return false;
-      } catch (err) {
-        log.error("kind:9021 join failed to send", { error: String(err) });
-        return false;
+      // A rejection from publishNow (e.g. a DisconnectedError from a socket flap
+      // mid-reconnect) is intentionally NOT caught here: BuzzClient's join-hook
+      // wrapper maps a thrown DisconnectedError onto the "unavailable" outcome
+      // (keep the subscription alive for the reconnect) and everything else onto
+      // "rejected". Swallowing it and returning false would collapse a transient
+      // flap into the fatal "rejected" path. Only a genuine relay OK-false is
+      // reported as a boolean rejection.
+      const ok = await buzz.publishNow(join);
+      if (ok.ok || ok.message.startsWith("duplicate:")) {
+        log.info("kind:9021 join accepted after membership rejection", {
+          channelId: id,
+        });
+        return true;
       }
+      log.warn("kind:9021 join rejected", { message: ok.message });
+      return false;
     },
     onFatal: (error: BuzzFatalError) => {
       log.error("fatal relay condition", {
@@ -347,9 +450,25 @@ export async function startBridge(
    * already triggered the ChannelManager re-run via the BuzzClient hook (§3).
    */
   const onListing = async (event: NostrEvent): Promise<void> => {
+    lastListingAt = Date.now();
     try {
       await mirror.handleListing(event);
     } catch (err) {
+      if (err instanceof ChannelUnresolvedError) {
+        // The Services channel is mid-re-run (channelId null), so this 38400
+        // cannot be mirrored. Name the condition and count it — a silent generic
+        // failure here hides a bridge that has stopped mirroring entirely while
+        // ChannelManager retries (finding H-6/M-4). The card is not recorded, so
+        // the live sub's `since = cursor − 300` window will redeliver it once
+        // the channel resolves; a fresh 38400 for the address also retries.
+        nullChannelDrops += 1;
+        log.error("38400 dropped: Services channel unresolved", {
+          id: event.id,
+          pubkey: event.pubkey,
+          droppedWhileUnresolved: nullChannelDrops,
+        });
+        return;
+      }
       if (err instanceof CardPublishError) {
         log.warn("card publish rejected; address not recorded", {
           address: err.address,
@@ -385,10 +504,12 @@ export async function startBridge(
 
   // 3. Footer recovery when the state file was missing or reset (§7).
   if (stateMissing || stateReset) {
-    const recovered = await recoverMirroredFromChannel(
-      buzz,
-      resolvedChannelId,
-      identity.publicKey,
+    const { mirrored: recovered, truncated } = normalizeRecovery(
+      await recoverMirroredFromChannel(
+        buzz,
+        resolvedChannelId,
+        identity.publicKey,
+      ),
     );
     const addresses = Object.entries(recovered);
     if (addresses.length > 0) {
@@ -398,10 +519,24 @@ export async function startBridge(
         }
       });
     }
-    log.info("footer recovery complete", {
-      reason: stateMissing ? "no-state-file" : "state-reset",
-      addresses: addresses.length,
-    });
+    if (truncated) {
+      // The scan hit the page cap: the rebuilt dedupe set is incomplete, so
+      // some already-mirrored listings will get a duplicate "new" card when
+      // hydration re-posts them (finding H-7). Surface it — this is the
+      // duplicate-card storm §7's recovery exists to bound.
+      log.warn(
+        "footer recovery truncated at the page cap; expect duplicate cards for listings past the scan window",
+        {
+          reason: stateMissing ? "no-state-file" : "state-reset",
+          addresses: addresses.length,
+        },
+      );
+    } else {
+      log.info("footer recovery complete", {
+        reason: stateMissing ? "no-state-file" : "state-reset",
+        addresses: addresses.length,
+      });
+    }
   }
 
   // 4. Connect Wolfe + full hydration; the cache is rebuilt on every start (§4).
@@ -423,7 +558,35 @@ export async function startBridge(
   wolfe.subscribeLive(onListing);
   ensureMentionsSubscription();
 
-  await state.flush();
+  // Operator-visible heartbeat (finding H-1): one line every 5 min that makes a
+  // silently-stopped mirror obvious. The ping/pong socket watchdogs live in the
+  // client files; this is purely for the human reading the logs.
+  const heartbeat = setInterval(() => {
+    if (stopped) return;
+    const secondsSinceLastListing =
+      lastListingAt === 0
+        ? null
+        : Math.round((Date.now() - lastListingAt) / 1000);
+    log.info("heartbeat", {
+      cacheSize: cache.size,
+      buzzQueueLength: buzz.queueLength,
+      wolfeCursor: state.getState().cursors.wolfe,
+      secondsSinceLastListing,
+      nullChannelDrops,
+    });
+  }, HEARTBEAT_INTERVAL_MS);
+  // A pure diagnostic must never hold the process open.
+  if (typeof heartbeat.unref === "function") heartbeat.unref();
+
+  // `flush()` now propagates write failures (finding M-3). A single transient
+  // failure of this startup barrier must not abort the whole boot — it is
+  // already logged at error via the store's `write-failed` warning, and the
+  // consecutive-failure escalation covers a persistently dead disk.
+  try {
+    await state.flush();
+  } catch (err) {
+    log.warn("startup state flush failed; continuing", { error: String(err) });
+  }
   log.info("nostrwolfe-bridge ready", {
     channelId: resolvedChannelId,
     listingsCached: cache.size,
@@ -443,12 +606,16 @@ export async function startBridge(
     stop: async (): Promise<void> => {
       if (stopped) return;
       stopped = true;
+      clearInterval(heartbeat);
       for (const timer of channelRerunTimers) clearTimeout(timer);
       channelRerunTimers.clear();
       mentionsSub?.close();
       mentionsSub = null;
       wolfe.close();
       buzz.close();
+      // `flush()` now propagates a real write failure (finding M-3), so this
+      // catch is no longer dead: a failed final durability write is logged at
+      // error rather than becoming an unhandled rejection out of stop().
       try {
         await state.flush();
       } catch (err) {

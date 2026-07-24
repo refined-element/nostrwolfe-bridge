@@ -27,6 +27,14 @@ export const FLUSH_DEBOUNCE_MS = 2000;
 /** Signals that trigger a synchronous flush before the process dies (spec §7). */
 export const FLUSH_SIGNALS: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
 
+/**
+ * Consecutive failed atomic writes before the store escalates to `onFatal`
+ * (finding M-3). A read-only FS or full disk otherwise runs forever with zero
+ * durability and only warn-level noise; after this many back-to-back failures
+ * the daemon is told to stop rather than pretend it is persisting.
+ */
+export const MAX_CONSECUTIVE_WRITE_FAILURES = 5;
+
 /** A fresh, empty state document for `community`. */
 export function emptyState(community: string): BridgeState {
   return {
@@ -155,9 +163,17 @@ export function parseState(text: string): BridgeState | null {
   };
 }
 
-/** Structured warning emitted by the store (corrupt file, community reset). */
+/**
+ * Structured warning emitted by the store.
+ *
+ * The three events are deliberately distinct so the caller can route them
+ * differently (finding M-3): `corrupt-state`/`community-mismatch` mean the
+ * on-disk document was thrown away (footer recovery must re-derive the dedupe
+ * set), whereas `write-failed` means a *persistence* failure with the in-memory
+ * state intact (no recovery, just a durability alarm at error level).
+ */
 export interface StateWarning {
-  event: "corrupt-state" | "community-mismatch";
+  event: "corrupt-state" | "community-mismatch" | "write-failed";
   message: string;
   [extra: string]: unknown;
 }
@@ -167,12 +183,19 @@ export interface StateStoreOptions {
   debounceMs?: number;
   /** Sink for warnings; defaults to a JSON line on stderr. */
   onWarn?: (warning: StateWarning) => void;
+  /**
+   * Escalation sink: called once after {@link MAX_CONSECUTIVE_WRITE_FAILURES}
+   * back-to-back write failures (finding M-3). The daemon uses it to go fatal;
+   * defaults to a no-op so a store constructed without it never crashes.
+   */
+  onFatal?: (error: Error) => void;
 }
 
 export class StateStore implements IStateStore {
   private readonly stateFile: string;
   private readonly debounceMs: number;
   private readonly onWarn: (warning: StateWarning) => void;
+  private readonly onFatal: (error: Error) => void;
 
   private state: BridgeState;
   private timer: NodeJS.Timeout | null = null;
@@ -180,6 +203,10 @@ export class StateStore implements IStateStore {
   /** Serializes writes so a debounced flush can never race an explicit one. */
   private chain: Promise<void> = Promise.resolve();
   private writes = 0;
+  /** Back-to-back write failures; reset to 0 by the next successful write. */
+  private consecutiveWriteFailures = 0;
+  /** Latched once escalation has fired, so `onFatal` is called at most once. */
+  private fatalEscalated = false;
 
   constructor(stateFile: string, options: StateStoreOptions = {}) {
     this.stateFile = stateFile;
@@ -189,6 +216,7 @@ export class StateStore implements IStateStore {
       ((w) => {
         process.stderr.write(`${JSON.stringify({ level: "warn", ...w })}\n`);
       });
+    this.onFatal = options.onFatal ?? (() => undefined);
     this.state = emptyState("");
   }
 
@@ -280,10 +308,18 @@ export class StateStore implements IStateStore {
     this.markDirty();
   }
 
-  /** Force an immediate atomic flush (ordering barriers, shutdown). */
+  /**
+   * Force an immediate atomic flush (ordering barriers, shutdown).
+   *
+   * Unlike the debounced path, an explicit `flush()` **propagates** a real write
+   * failure to its awaiting caller (finding M-3) — the internal write chain
+   * still never rejects (so the debounce timer's `void enqueueWrite()` cannot
+   * raise an unhandled rejection), but the caller here always awaits, so it is
+   * safe (and honest) to surface the error.
+   */
   flush(): Promise<void> {
     this.cancelTimer();
-    return this.enqueueWrite();
+    return this.enqueueWrite(true);
   }
 
   /**
@@ -318,9 +354,13 @@ export class StateStore implements IStateStore {
         try {
           this.flushSync();
         } catch (err) {
+          // A failed shutdown flush is a durability failure, not a corrupt
+          // document — tag it `write-failed` so the caller does not mistake it
+          // for a state reset and kick off footer recovery (finding M-3).
           this.onWarn({
-            event: "corrupt-state",
+            event: "write-failed",
             message: `flush on ${signal} failed: ${String(err)}`,
+            stateFile: this.stateFile,
           });
         }
         onSignal?.(signal);
@@ -381,9 +421,10 @@ export class StateStore implements IStateStore {
    * reported, and the document is left dirty with the debounce re-armed so the
    * write is retried.
    */
-  private enqueueWrite(): Promise<void> {
+  private enqueueWrite(propagate = false): Promise<void> {
     // Snapshot at enqueue time is wrong (later mutations must win), so the
     // serialization happens inside the chained task instead.
+    let failure: Error | null = null;
     this.chain = this.chain.then(async () => {
       // Serialize first, then clear `dirty`, so a mutation arriving *during*
       // the await still marks the document dirty for the next flush.
@@ -392,15 +433,47 @@ export class StateStore implements IStateStore {
       try {
         await atomicWrite(this.stateFile, payload);
         this.writes++;
+        this.consecutiveWriteFailures = 0;
       } catch (err) {
-        this.onWarn({
-          event: "corrupt-state",
-          message: `state write failed: ${String(err)}`,
-          stateFile: this.stateFile,
-        });
-        this.markDirty();
+        failure = err as Error;
+        this.onWriteFailure(err);
       }
     });
-    return this.chain;
+    const chained = this.chain;
+    if (!propagate) return chained;
+    // The chain itself must never reject (see the doc-comment above), so the
+    // caller-facing rejection is a *separate* continuation off the chain — it
+    // surfaces the failure to `flush()`'s awaiter without poisoning `this.chain`.
+    return chained.then(() => {
+      if (failure !== null) throw failure;
+    });
+  }
+
+  /**
+   * Shared handling for a failed atomic write (async or sync path): warn with
+   * the dedicated `write-failed` event, leave the document dirty for retry, and
+   * escalate to `onFatal` after {@link MAX_CONSECUTIVE_WRITE_FAILURES}
+   * back-to-back failures (finding M-3).
+   */
+  private onWriteFailure(err: unknown): void {
+    this.consecutiveWriteFailures += 1;
+    this.onWarn({
+      event: "write-failed",
+      message: `state write failed: ${String(err)}`,
+      stateFile: this.stateFile,
+      consecutiveFailures: this.consecutiveWriteFailures,
+    });
+    this.markDirty();
+    if (
+      this.consecutiveWriteFailures >= MAX_CONSECUTIVE_WRITE_FAILURES &&
+      !this.fatalEscalated
+    ) {
+      this.fatalEscalated = true;
+      this.onFatal(
+        new Error(
+          `state store failed ${String(this.consecutiveWriteFailures)} consecutive writes to ${this.stateFile}; last error: ${String(err)}`,
+        ),
+      );
+    }
   }
 }

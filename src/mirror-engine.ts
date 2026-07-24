@@ -3,7 +3,21 @@
 import { finalizeEvent, verifyEvent } from "nostr-tools/pure";
 import { npubEncode, decode as nip19Decode } from "nostr-tools/nip19";
 
+import { FrameTooLargeError } from "./buzz-client.js";
 import { normalizeDialect } from "./dialect.js";
+import {
+  CARD_HEADER_PREFIXES,
+  CARD_SEPARATOR,
+  sanitizeContent,
+  sanitizeField,
+  stripControl,
+} from "./sanitize.js";
+
+// The sanitizer moved to ./sanitize.js so mirror-engine and query-responder
+// share one hardened implementation (Security §2). Re-exported here so existing
+// importers of these names from mirror-engine keep working.
+export { CONTENT_MAX } from "./sanitize.js";
+export { sanitizeContent, sanitizeField };
 
 import type {
   CardKind,
@@ -15,6 +29,7 @@ import type {
   IStateStore,
   MirrorOutcome,
   MirroredEntry,
+  MirroredMap,
   Negotiable,
   NostrEvent,
   NostrTag,
@@ -33,16 +48,45 @@ const CHAT_KIND = 9;
 const DASH = "—";
 
 /** Card separator line that precedes the machine-readable footer. */
-const SEPARATOR = "─";
+const SEPARATOR = CARD_SEPARATOR;
 
-/** Max chars of provider `content` rendered into a card (§5 step 4, security §2). */
-export const CONTENT_MAX = 400;
+/**
+ * Clock-skew allowance shared with the live-sub `since` (§4). Declared here (not
+ * further down) because {@link parseListing} uses it as the future-timestamp
+ * ceiling, and a listing dated past `now + CURSOR_SKEW` is dropped so it cannot
+ * poison the persisted wolfe cursor (security H-1).
+ */
+const CURSOR_SKEW = 300;
 
-/** Card headers. The footer parser (§7) keys off these exact strings. */
+/**
+ * A card renders each `s`, `t` and `price` tag, and every value is width-capped
+ * by {@link FIELD_MAX}/{@link CONTENT_MAX}. But nothing caps the *count* of those
+ * tags, so a listing carrying thousands of them would still join into a card
+ * past the 65,536-byte Buzz frame cap — falsifying the spec's "well under by
+ * construction" claim and, worse, making {@link formatCard}'s output throw
+ * {@link FrameTooLargeError} on publish (security L-3 / M-1). Beyond these caps a
+ * single `+K more` marker stands in, so the card is bounded by construction. The
+ * caps are small enough that the worst case (caps × per-field widths) stays far
+ * under the frame budget.
+ */
+export const RENDER_MAX = {
+  prices: 20,
+  categories: 20,
+  hashtags: 20,
+} as const;
+
+/** Strict decimal a card amount must match to render as a number, else `—`. */
+const DECIMAL_AMOUNT = /^\d+(\.\d+)?$/;
+
+/**
+ * Card headers. The footer parser (§7) keys off these exact strings, and the
+ * chrome-rejection filter in {@link sanitizeContent} keys off the same prefixes
+ * — both are derived from the one shared constant so they cannot drift.
+ */
 const HEADERS: Record<CardKind, string> = {
-  new: "🐺 New service: ",
-  updated: "🐺 Updated: ",
-  delisted: "🐺 Delisted: ",
+  new: `${CARD_HEADER_PREFIXES[0]} `,
+  updated: `${CARD_HEADER_PREFIXES[1]} `,
+  delisted: `${CARD_HEADER_PREFIXES[2]} `,
 };
 
 // ---------------------------------------------------------------------------
@@ -72,24 +116,12 @@ function log(
 }
 
 // ---------------------------------------------------------------------------
-// Sanitization (spec §5 step 4 + Security §2)
+// Sanitization caps (spec §5 step 4 + Security §2)
 // ---------------------------------------------------------------------------
-
-/**
- * C0/C1 control characters plus zero-width, bidi-override and BOM codepoints.
- * The channel is read by LLM-driven buzz-agents, so invisible steering
- * characters are stripped alongside classic control bytes (Security §2).
- * `\n` is preserved here and handled per-context by the callers.
- */
-const CONTROL_CHARS =
-  // eslint-disable-next-line no-control-regex
-  /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u00AD\u180E\u200B-\u200F\u2028\u2029\u202A-\u202E\u2066-\u2069\uFEFF]/g;
-
-/** The bridge's own command grammar; a listing must never be re-interpretable. */
-const BRIDGE_COMMAND = /@bridge\b/i;
-
-/** A provider line forging the machine-readable footer grammar. */
-const FOOTER_LINE = /^nw:/i;
+//
+// The sanitizer functions themselves (stripControl, sanitizeField,
+// sanitizeContent) live in ./sanitize.js — the one hardened implementation
+// shared with query-responder. Only the card-specific per-field caps stay here.
 
 /**
  * Per-field render caps. `content` has its own {@link CONTENT_MAX}; every
@@ -97,7 +129,11 @@ const FOOTER_LINE = /^nw:/i;
  * card past the 65,536-byte Buzz WS frame cap (§2 frame budget).
  */
 export const FIELD_MAX = {
-  /** `d` — also the address/footer key, so the cap is generous but finite. */
+  /**
+   * `d` display hint only. The address/footer/cache **key** is the *untruncated*
+   * {@link normalizeDKey} value (see there for why truncating the key was wrong);
+   * this width is retained for backward compat but no longer bounds the key.
+   */
   d: 200,
   url: 512,
   short: 64,
@@ -109,64 +145,44 @@ export const FIELD_MAX = {
   price: 160,
 } as const;
 
-/** Strip control chars; collapse tabs to spaces. Keeps newlines. */
-function stripControl(raw: string): string {
-  return raw.replace(CONTROL_CHARS, "").replace(/\t/g, " ").replace(/\r/g, "");
-}
-
-/**
- * Sanitize a value rendered into a single card field: no control chars, no
- * newlines (a newline in a tag value could otherwise forge a card line or
- * footer), no bridge command grammar, whitespace-collapsed, trimmed, and capped.
- *
- * Security §2 requires "anything matching the bridge's own command grammar" to
- * be stripped from the whole card, not just from `content` — tags come from the
- * same unauthenticated relay and land in the same LLM-read channel, so the
- * `@bridge` cut lives here rather than only in {@link sanitizeContent}.
- *
- * Idempotent: sanitizing an already-sanitized value (including a truncated one)
- * returns it unchanged, which is what lets the address, header and footer be
- * derived from the same string by construction (§7).
- */
-export function sanitizeField(
-  raw: string | undefined,
-  max: number = FIELD_MAX.url,
-): string {
-  if (raw === undefined) return "";
-  let s = stripControl(raw);
-  const cmd = s.search(BRIDGE_COMMAND);
-  if (cmd >= 0) s = s.slice(0, cmd);
-  s = s.replace(/\n+/g, " ").replace(/\s+/g, " ").trim();
-  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
-}
-
-/**
- * Sanitize untrusted provider `content` for rendering (Security §2):
- * 1. strip control/zero-width/bidi characters,
- * 2. cut each line at any `@bridge` occurrence (the bridge command grammar),
- * 3. drop any line beginning with `nw:` (a forged machine-readable footer would
- *    otherwise poison footer-based recovery, §7),
- * 4. drop blank lines, then truncate to {@link CONTENT_MAX} chars.
- */
-export function sanitizeContent(raw: string): string {
-  const lines = stripControl(raw)
-    .split("\n")
-    .map((line) => {
-      const cmd = line.search(BRIDGE_COMMAND);
-      return (cmd >= 0 ? line.slice(0, cmd) : line).trim();
-    })
-    .filter((line) => line.length > 0 && !FOOTER_LINE.test(line));
-
-  const joined = lines.join("\n");
-  if (joined.length <= CONTENT_MAX) return joined;
-  // Truncation only removes a suffix, so it can never create a new line start
-  // and therefore can never resurrect a stripped `nw:` / `@bridge` line.
-  return joined.slice(0, CONTENT_MAX - 1) + "…";
-}
-
 // ---------------------------------------------------------------------------
 // Tag parsing (spec §5 step 1-2; nips/agent-service-agreements.md kind 38400)
 // ---------------------------------------------------------------------------
+
+/**
+ * Canonical `d` normalization for the address/footer/cache **key** (§7).
+ *
+ * Unlike {@link sanitizeField} it deliberately does NOT cut at the `@bridge`
+ * grammar and does NOT truncate:
+ *   - the `@bridge` cut turned a legitimate service id like `@bridge-monitor`
+ *     into the empty string, dropping the whole listing as invalid (spec L-2);
+ *   - a fixed-width truncation collided two distinct `d` values that shared a
+ *     long common prefix onto one address (code-reviewer L1).
+ * It still strips control/invisible chars and flattens newlines, so a `d` can
+ * never forge extra card lines or smuggle a zero-width payload (Security §2).
+ *
+ * The full value is carried verbatim in the footer — the sole §7 recovery key —
+ * so the address, the cache key, the footer and the header are one and the same
+ * string by construction. A `d` that itself contains `@bridge` therefore appears
+ * in the card; this is unavoidable (the footer must reproduce the key exactly)
+ * and safe, because a message is only treated as a bridge command when its
+ * *content starts with* `@bridge` and is not the bridge's own post — never for a
+ * mid-line substring inside a card (see `query-responder.isAddressedToBridge`).
+ */
+export function normalizeDKey(raw: string | undefined): string {
+  if (raw === undefined) return "";
+  return stripControl(raw).replace(/\n+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Join `items` with `sep`, rendering at most `max` and replacing the remainder
+ * with a single `+K more` marker so the result is bounded by construction
+ * regardless of how many tags a hostile listing carries (see {@link RENDER_MAX}).
+ */
+function capJoin(items: string[], max: number, sep: string): string {
+  if (items.length <= max) return items.join(sep);
+  return [...items.slice(0, max), `+${items.length - max} more`].join(sep);
+}
 
 function tagValues(tags: NostrTag[], name: string): NostrTag[] {
   return tags.filter((t) => t[0] === name);
@@ -182,8 +198,12 @@ function parseNegotiable(tag: NostrTag | undefined): Negotiable | undefined {
   if (v === "true") return { kind: "yes" };
   if (v === "false") return { kind: "no" };
   if (v === "floor") {
-    const sats = Number((tag[2] ?? "").trim());
-    if (Number.isFinite(sats)) return { kind: "floor", sats };
+    // Require an actual amount: `Number("") === 0` passes `Number.isFinite`, so
+    // a bare `["negotiable","floor"]` used to fabricate a "floor 0 sats" the
+    // publisher never stated (L-2). No amount → undefined → renders as `—`.
+    const raw = (tag[2] ?? "").trim();
+    const sats = Number(raw);
+    if (raw.length > 0 && Number.isFinite(sats)) return { kind: "floor", sats };
   }
   return undefined;
 }
@@ -198,7 +218,7 @@ function parseNegotiable(tag: NostrTag | undefined): Negotiable | undefined {
  * lines wherever the address is rendered (Security §2).
  */
 export function addressOf(event: NostrEvent): string | null {
-  const d = sanitizeField(firstTag(event.tags, "d")?.[1], FIELD_MAX.d);
+  const d = normalizeDKey(firstTag(event.tags, "d")?.[1]);
   if (d.length === 0) return null;
   return `${LISTING_KIND}:${event.pubkey}:${d}`;
 }
@@ -211,6 +231,12 @@ export interface ParseListingOptions {
    * parser is strictly NIP-A5 and most of the live relay is dropped.
    */
   acceptDialects?: boolean;
+  /**
+   * Current unix time (seconds) used for the future-timestamp sanity check.
+   * Injectable so tests can pin it; defaults to the wall clock. An event dated
+   * past `now + CURSOR_SKEW` is dropped (security H-1).
+   */
+  now?: number;
 }
 
 /**
@@ -230,7 +256,7 @@ function buildListing(
   // Normalize once, here: `listing.d`, `listing.address`, the card header and
   // the card footer are all this one string, so the footer a recovery scan
   // reads is always exactly the key the live path looks up (§7).
-  const d = sanitizeField(firstTag(tags, "d")?.[1], FIELD_MAX.d);
+  const d = normalizeDKey(firstTag(tags, "d")?.[1]);
   if (d.length === 0) return null;
 
   const s = tagValues(tags, "s")
@@ -326,6 +352,13 @@ export function parseListing(
   options: ParseListingOptions = {},
 ): ParsedListing | null {
   if (event.kind !== LISTING_KIND) return null;
+  // Future-timestamp clamp (security H-1): one attacker-signed 38400 dated far
+  // ahead would otherwise become `max(created_at)` and permanently push the
+  // persisted wolfe cursor past real time, blinding the live sub (`since =
+  // cursor − 300`). Same 300s skew the subscriber uses. Injectable clock for
+  // tests; wall clock otherwise.
+  const now = options.now ?? Math.floor(Date.now() / 1000);
+  if (event.created_at > now + CURSOR_SKEW) return null;
   // Verify a plain 7-field copy: nostr-tools caches a "already verified" symbol
   // on event objects, and an object that carried it in would skip BIP-340
   // entirely. Untrusted input must always be re-verified from scratch.
@@ -378,8 +411,10 @@ function trimNumber(n: number): string {
 export function formatPriceTier(tier: PriceTier): string {
   const note = sanitizeField(tier.note, FIELD_MAX.price);
   if (note.length > 0) return note;
-  if (tier.amount.length === 0 || !Number.isFinite(Number(tier.amount)))
-    return DASH;
+  // Strict decimal only, to agree with query-responder's `find` gate (spec L-7):
+  // `Number.isFinite(Number(x))` also accepts `0x10`, `1e3` and ` 5 `, so the
+  // card and `find` disagreed on what counts as a price. Anything else → `—`.
+  if (!DECIMAL_AMOUNT.test(tier.amount)) return DASH;
   const parts = [sanitizeField(tier.amount, FIELD_MAX.short)];
   const currency = sanitizeField(tier.currency, FIELD_MAX.short);
   if (currency.length > 0) parts.push(currency);
@@ -388,10 +423,17 @@ export function formatPriceTier(tier: PriceTier): string {
   return parts.join(" ");
 }
 
-/** All tiers joined with ` · ` (§5 step 4 "additional tiers"). */
+/**
+ * Tiers joined with ` · ` (§5 step 4 "additional tiers"), rendering at most
+ * {@link RENDER_MAX.prices} so a listing with thousands of `price` tags cannot
+ * blow the frame budget; the remainder collapses to a `+K more` marker.
+ */
 export function formatPrices(tiers: PriceTier[]): string {
   if (tiers.length === 0) return DASH;
-  return tiers.map(formatPriceTier).join(" · ");
+  const shown = tiers.slice(0, RENDER_MAX.prices).map(formatPriceTier);
+  return tiers.length > RENDER_MAX.prices
+    ? [...shown, `+${tiers.length - RENDER_MAX.prices} more`].join(" · ")
+    : shown.join(" · ");
 }
 
 /** l402 URL, else endpoint URL (+ method), else em-dash. */
@@ -434,14 +476,14 @@ export function formatNegotiable(n: Negotiable | undefined): string {
  * Update cards are identical to new-listing cards in every field and line
  * except the header. Delisted notes carry only header + separator + footer.
  * The final line is always the machine-readable footer `nw:38400:<pubkey>:<d>`
- * — the sole recovery key (§7), which is why `d` is field-sanitized (no
+ * — the sole recovery key (§7), which is why `d` is key-normalized (no
  * newlines) before it reaches either the header or the footer.
  */
 export function formatCard(listing: ParsedListing, kind: CardKind): string {
-  // `listing.d` is already the canonical sanitized value (parseListing), so the
-  // footer here is byte-identical to `listing.address`'s `d` part by
-  // construction — the invariant footer recovery depends on (§7).
-  const d = sanitizeField(listing.d, FIELD_MAX.d);
+  // `listing.d` is already the canonical key (parseListing → normalizeDKey);
+  // re-normalizing is idempotent and keeps the footer byte-identical to
+  // `listing.address`'s `d` part — the invariant footer recovery depends on (§7).
+  const d = normalizeDKey(listing.d);
   const footer = `nw:${LISTING_KIND}:${listing.pubkey}:${d}`;
   const header = `${HEADERS[kind]}${d}`;
 
@@ -450,16 +492,22 @@ export function formatCard(listing: ParsedListing, kind: CardKind): string {
   }
 
   const categories =
-    listing.s
-      .map((v) => sanitizeField(v, FIELD_MAX.short))
-      .filter((v) => v.length > 0)
-      .join(", ") || DASH;
+    capJoin(
+      listing.s
+        .map((v) => sanitizeField(v, FIELD_MAX.short))
+        .filter((v) => v.length > 0),
+      RENDER_MAX.categories,
+      ", ",
+    ) || DASH;
   const hashtags =
-    listing.t
-      .map((tag) => sanitizeField(tag, FIELD_MAX.short))
-      .filter((v) => v.length > 0)
-      .map((v) => `#${v}`)
-      .join(" ") || DASH;
+    capJoin(
+      listing.t
+        .map((tag) => sanitizeField(tag, FIELD_MAX.short))
+        .filter((v) => v.length > 0)
+        .map((v) => `#${v}`),
+      RENDER_MAX.hashtags,
+      " ",
+    ) || DASH;
   const capacity = listing.capacity
     ? sanitizeField(listing.capacity, FIELD_MAX.short)
     : DASH;
@@ -510,9 +558,6 @@ export class CardPublishError extends Error {
   }
 }
 
-/** Clock-skew allowance shared with the live-sub `since` (§4). */
-const CURSOR_SKEW = 300;
-
 function secretKeyFrom(nsec: string): Uint8Array {
   const trimmed = nsec.trim();
   if (/^[0-9a-f]{64}$/i.test(trimmed)) {
@@ -537,6 +582,12 @@ export class MirrorEngine implements IMirrorEngine {
     private readonly cache: IListingCache,
     private readonly state: IStateStore,
     private readonly getChannelId: () => string,
+    /**
+     * Unix-seconds clock, injectable for tests. Feeds both the future-timestamp
+     * drop in {@link parseListing} and the {@link advanceCursor} ceiling so a
+     * forged far-future 38400 can never poison the persisted cursor (H-1).
+     */
+    private readonly now: () => number = () => Math.floor(Date.now() / 1000),
   ) {
     this.level = config.logLevel;
   }
@@ -546,12 +597,13 @@ export class MirrorEngine implements IMirrorEngine {
    *
    * Decision inputs: the *state* `mirrored` entry is the replace/skip clock
    * (footer recovery seeds `createdAt: 0`, §7), while the cap is measured
-   * against the in-memory cache size.
+   * against the tracked `mirrored`-entry count (security M-1).
    */
   async handleListing(event: NostrEvent): Promise<MirrorOutcome> {
     // §5 step 1 — validate.
     const listing = parseListing(event, {
       acceptDialects: this.config.mirrorAcceptDialects,
+      now: this.now(),
     });
     if (!listing) {
       log(this.level, "debug", "dropped invalid 38400", {
@@ -561,14 +613,34 @@ export class MirrorEngine implements IMirrorEngine {
       return { type: "skip", reason: "invalid" };
     }
 
-    const outcome = await this.decide(listing);
-    // §4 — the cursor is the max `created_at` *terminally* processed. It is
-    // advanced only here, after `decide` returned without throwing: a card
-    // publish that was rejected (CardPublishError) or a channel that is
-    // mid-re-run must not move the cursor past an event the live sub would then
-    // never redeliver (`since = cursor − 300`).
-    this.advanceCursor(listing.createdAt);
-    return outcome;
+    try {
+      const outcome = await this.decide(listing);
+      // §4 — the cursor is the max `created_at` *terminally* processed. It is
+      // advanced only here, after `decide` returned without throwing: a card
+      // publish that was rejected (CardPublishError) or a channel that is
+      // mid-re-run must not move the cursor past an event the live sub would then
+      // never redeliver (`since = cursor − 300`).
+      this.advanceCursor(listing.createdAt);
+      return outcome;
+    } catch (err) {
+      if (err instanceof FrameTooLargeError) {
+        // The count caps in formatCard make this unreachable by construction,
+        // but as defense in depth: a card that still exceeds the frame cap can
+        // never be mirrored, so advance PAST it. Leaving the cursor parked would
+        // make every reconnect (`since = cursor − 300`) reprocess the same
+        // poison event forever, wedging the live sub behind it (security L-3).
+        // Re-thrown so index.ts logs it as "never mirrorable".
+        log(this.level, "error", "oversized card; advancing cursor past it", {
+          address: listing.address,
+          bytes: err.bytes,
+        });
+        this.advanceCursor(listing.createdAt);
+        throw err;
+      }
+      // CardPublishError (transient relay rejection) must NOT advance the
+      // cursor — the event has to stay redeliverable for the retry (§4).
+      throw err;
+    }
   }
 
   /** The §5 decision table proper. Throws if the card publish is rejected. */
@@ -585,8 +657,12 @@ export class MirrorEngine implements IMirrorEngine {
         });
         return { type: "skip", reason: "category-mismatch" };
       }
-      if (this.cache.size >= this.config.mirrorMaxListings) {
-        // §5 step 3 — no eviction in v1: skip + warn (Open question 5).
+      if (this.mirroredCount() >= this.config.mirrorMaxListings) {
+        // §5 step 3 — no eviction in v1: skip + warn (Open question 5). Measured
+        // against the `mirrored` map, NOT `cache.size`: delisted addresses are
+        // deleted from the cache but retained in `mirrored` for dedupe, so a
+        // cache-size cap let category-exit churn grow `mirrored` (and the state
+        // file) without bound (security M-1).
         log(
           this.level,
           "warn",
@@ -614,13 +690,27 @@ export class MirrorEngine implements IMirrorEngine {
       replaces =
         listing.event.id !== entry.eventId && listing.event.id < entry.eventId;
       if (!replaces) {
+        // Repopulate the search cache on the same-timestamp duplicate path.
+        // On a normal restart the state file is intact, so hydration replays
+        // every recorded event and each live address arrives here (its current
+        // version matches the stored `created_at`). Without this the cache would
+        // stay empty forever → `@bridge find` reports "0 listings cached" and
+        // `mirroredCount`/`cache.size` never reach the cap (C-1 / H1).
+        this.cacheIfLive(listing, matches, entry);
         return { type: "skip", reason: "duplicate", address };
       }
     } else {
+      // Out-of-order replay: this event is OLDER than the stored current
+      // version, so it may only *seed* an empty cache slot, never clobber a
+      // newer entry already there (guarded inside cacheIfLive).
+      this.cacheIfLive(listing, matches, entry);
       return { type: "skip", reason: "out-of-order", address };
     }
 
-    if (!replaces) return { type: "skip", reason: "duplicate", address };
+    if (!replaces) {
+      this.cacheIfLive(listing, matches, entry);
+      return { type: "skip", reason: "duplicate", address };
+    }
 
     if (matches) {
       const cardMsgId = await this.postCard(listing, "updated");
@@ -636,6 +726,59 @@ export class MirrorEngine implements IMirrorEngine {
     this.record(listing, cardMsgId, true);
     this.cache.delete(address);
     return { type: "delisted", address, cardMsgId };
+  }
+
+  /**
+   * Put a listing into the search cache from a skip path iff it is *live* — its
+   * categories still match and its `mirrored` entry is not a delisted tombstone.
+   *
+   * The event whose id equals the stored `eventId` is the canonical current
+   * version, so it always (re)sets the slot. Any other event (a same-second
+   * loser or an older out-of-order replay) only fills an *empty* slot, so it can
+   * never overwrite the canonical version once cached.
+   */
+  private cacheIfLive(
+    listing: ParsedListing,
+    matches: boolean,
+    entry: MirroredEntry,
+  ): void {
+    if (!matches || entry.delisted) return;
+    const isCanonical = listing.event.id === entry.eventId;
+    if (isCanonical || !this.cache.has(listing.address)) {
+      this.cache.set(listing.address, listing);
+    }
+  }
+
+  /** Distinct addresses tracked in `mirrored` — the cap denominator (M-1). */
+  private mirroredCount(): number {
+    return Object.keys(this.state.getState().mirrored).length;
+  }
+
+  /**
+   * Upper bound on retained delisted tombstones. Tombstones share the address
+   * budget with live listings; without a sub-cap, category-exit churn could
+   * fill the whole `MIRROR_MAX_LISTINGS` budget with tombstones and starve live
+   * listings. Half the budget is a heuristic split (security M-1).
+   */
+  private delistedBudget(): number {
+    return Math.max(1, Math.floor(this.config.mirrorMaxListings / 2));
+  }
+
+  /**
+   * Drop the oldest delisted tombstones beyond {@link delistedBudget}. Only
+   * ever removes *delisted* entries, so dedupe of live listings is untouched; a
+   * pruned address that reappears simply posts a fresh "new" card.
+   */
+  private pruneTombstones(mirrored: MirroredMap): void {
+    const limit = this.delistedBudget();
+    const tombstones = Object.entries(mirrored).filter(([, e]) => e.delisted);
+    if (tombstones.length <= limit) return;
+    tombstones
+      .sort((a, b) => a[1].createdAt - b[1].createdAt)
+      .slice(0, tombstones.length - limit)
+      .forEach(([addr]) => {
+        delete mirrored[addr];
+      });
   }
 
   /** `MIRROR_CATEGORIES` is applied here, client-side only (§1, §5 step 3). */
@@ -690,13 +833,20 @@ export class MirrorEngine implements IMirrorEngine {
     };
     this.state.mutate((s) => {
       s.mirrored[listing.address] = entry;
+      // Bound retained tombstones so category-exit churn can't squat the whole
+      // address budget (security M-1). Only runs when we just wrote a tombstone.
+      if (delisted) this.pruneTombstones(s.mirrored);
     });
   }
 
   private advanceCursor(createdAt: number): void {
-    if (createdAt <= this.state.getState().cursors.wolfe) return;
+    // Clamp to `now + skew` as defense in depth: parseListing already drops
+    // future-dated events, but a clamp here means a bad `created_at` can never
+    // push the persisted cursor ahead of real time and blind the live sub (H-1).
+    const clamped = Math.min(createdAt, this.now() + CURSOR_SKEW);
+    if (clamped <= this.state.getState().cursors.wolfe) return;
     this.state.mutate((s) => {
-      if (createdAt > s.cursors.wolfe) s.cursors.wolfe = createdAt;
+      if (clamped > s.cursors.wolfe) s.cursors.wolfe = clamped;
     });
   }
 

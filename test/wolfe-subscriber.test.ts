@@ -89,7 +89,7 @@ describe("WolfeSubscriber.hydrate (§4 startup hydration)", () => {
     expect(seen).toHaveLength(250);
     expect(new Set(seen.map((e) => e.id)).size).toBe(250);
 
-    const pages = relay.reqsFor("wolfe-hydrate");
+    const pages = relay.reqsForPrefix("wolfe-hydrate");
     expect(pages.length).toBeGreaterThan(1);
     // Every page carries the configured limit; only the first has no `until`.
     expect(pages[0]!.filters[0]).toEqual({ kinds: [38400], limit: 100 });
@@ -119,7 +119,7 @@ describe("WolfeSubscriber.hydrate (§4 startup hydration)", () => {
     });
 
     expect(seen).toHaveLength(120);
-    for (const req of relay.reqsFor("wolfe-hydrate")) {
+    for (const req of relay.reqsForPrefix("wolfe-hydrate")) {
       expect(req.filters[0]!.since).toBeUndefined();
     }
   });
@@ -330,7 +330,7 @@ describe("WolfeSubscriber.subscribeLive (§4 live subscription)", () => {
     for (let i = 0; i < 20; i++) expect(delivered.has(2000 + i)).toBe(true);
 
     // The gap was drained by paged REQs, then the live sub was re-opened.
-    const drains = relay.reqsFor("wolfe-drain");
+    const drains = relay.reqsForPrefix("wolfe-drain");
     expect(drains.length).toBeGreaterThan(1);
     for (const drain of drains) {
       expect(drain.filters[0]!.since).toBe(0);
@@ -378,7 +378,10 @@ describe("WolfeSubscriber.subscribeLive (§4 live subscription)", () => {
     // Second disconnect, landing strictly inside `await this.queue`: every
     // drain page is already on the wire, but the slow listener is still
     // chewing through them.
-    await waitFor(() => relay!.reqsFor("wolfe-drain").length >= 4, 10_000);
+    await waitFor(
+      () => relay!.reqsForPrefix("wolfe-drain").length >= 4,
+      10_000,
+    );
     await waitFor(() => seen.length >= 2, 10_000);
     expect(seen.length).toBeLessThan(20);
     relay.dropConnections();
@@ -390,5 +393,94 @@ describe("WolfeSubscriber.subscribeLive (§4 live subscription)", () => {
 
     relay.broadcast(listing(500, 9_000));
     await waitFor(() => seen.some((e) => e.created_at === 9_000), 10_000);
+  });
+
+  it("re-issues the live sub on CLOSED, then drops the connection to reconnect", async () => {
+    // C-3: a CLOSED on the live sub leaves the socket OPEN, so onDisconnect
+    // never fires. Without re-issue-then-drop, mirroring stops permanently on a
+    // healthy-looking connection. The relay CLOSEDs the first four live REQs
+    // (initial + 3 bounded in-place re-issues); the fifth attempt escalates to
+    // dropping the connection, and the post-reconnect REQ is served for real.
+    relay = await StrfryMock.start();
+    relay.closeReqs("wolfe-38400", 4, "closed: rate-limited");
+
+    subscriber = new WolfeSubscriber(baseConfig(relay.url), () => 5000, {
+      minBackoffMs: 5,
+      maxBackoffMs: 20,
+    });
+
+    const seen: NostrEvent[] = [];
+    subscriber.subscribeLive((e) => {
+      seen.push(e);
+    });
+
+    // Four CLOSEDs -> four re-issues; the fifth REQ is the healthy one issued
+    // after the connection was dropped and the reconnect path restored the sub.
+    await waitFor(() => relay!.reqsFor("wolfe-38400").length >= 5, 10_000);
+    // The connection was actually dropped and re-established (not just re-REQ'd).
+    expect(relay.connectionCount).toBeGreaterThanOrEqual(2);
+
+    // The now-healthy live sub delivers new events again.
+    relay.broadcast(listing(99, 6000));
+    await waitFor(() => seen.some((e) => e.created_at === 6000), 10_000);
+  });
+
+  it("surfaces a hard failure when a hydrate page stays CLOSED, never a silent empty", async () => {
+    // C-2: resolving a CLOSED paged REQ as an empty page made hydrate break on
+    // page 0 and finish with zero listings. CLOSED must reject so requestPage's
+    // retry ladder runs; a persistent CLOSED then throws out of hydrate.
+    relay = await StrfryMock.start();
+    for (let i = 0; i < 10; i++) relay.add(listing(i, 1000 + i));
+    // Every hydrate page REQ is refused.
+    relay.closeReqs("wolfe-hydrate", 100, "closed: rate-limited");
+
+    subscriber = new WolfeSubscriber(baseConfig(relay.url), () => 0, {
+      minBackoffMs: 5,
+      maxBackoffMs: 20,
+      pageRetries: 2,
+    });
+
+    const seen: NostrEvent[] = [];
+    await expect(
+      subscriber.hydrate((e) => {
+        seen.push(e);
+      }),
+    ).rejects.toThrow(/closed/);
+
+    // Not a silent empty: nothing was mirrored, and the ladder actually retried
+    // (1 initial + 2 retries = 3 REQs, all on the same page-0 sub id).
+    expect(seen).toHaveLength(0);
+    const pages = relay.reqsForPrefix("wolfe-hydrate");
+    expect(pages.length).toBeGreaterThan(1);
+    expect(pages.every((p) => p.subId === "wolfe-hydrate-0")).toBe(true);
+  });
+
+  it("sends CLOSE and uses a unique sub id when a page times out", async () => {
+    // M-6: a timed-out REQ must CLOSE its sub (else it leaks a server-side
+    // subscription) and paged sub ids must be unique per page.
+    relay = await StrfryMock.start();
+    for (let i = 0; i < 5; i++) relay.add(listing(i, 1000 + i));
+    // Swallow only the first page REQ so its timeout fires; the retry is served.
+    relay.stallReqs("wolfe-hydrate", 1);
+
+    subscriber = new WolfeSubscriber(baseConfig(relay.url), () => 0, {
+      minBackoffMs: 5,
+      maxBackoffMs: 20,
+      pageTimeoutMs: 60,
+      pageRetries: 3,
+    });
+
+    const seen: NostrEvent[] = [];
+    await subscriber.hydrate((e) => {
+      seen.push(e);
+    });
+
+    // The retry after the timeout completed hydration.
+    expect(new Set(seen.map((e) => e.id)).size).toBe(5);
+    // Every paged sub id is unique-per-page (`wolfe-hydrate-<page>`).
+    const pages = relay.reqsForPrefix("wolfe-hydrate");
+    expect(pages.every((p) => /^wolfe-hydrate-\d+$/.test(p.subId))).toBe(true);
+    // The timed-out page-0 REQ was CLOSEd (leak prevention).
+    expect(relay.closesFor("wolfe-hydrate-0").length).toBeGreaterThanOrEqual(1);
   });
 });

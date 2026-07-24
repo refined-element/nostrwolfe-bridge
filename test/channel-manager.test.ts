@@ -1,12 +1,13 @@
-import { EventEmitter } from "node:events";
-
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { afterEach, describe, expect, it, beforeEach, vi } from "vitest";
 import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
 
 import {
   ChannelManager,
   collapseMetadata,
   deriveChannelId,
+  DiscoveryTruncatedError,
+  ENSURE_CHANNEL_DEADLINE_MS,
+  EnsureChannelTimeoutError,
   pickChannel,
   uuidv5,
   type ChannelCandidate,
@@ -92,6 +93,12 @@ class FakeBuzz implements IBuzzClient {
   });
   /** Observed side-state at publish time, keyed by publish sequence. */
   publishHooks: ((event: NostrEvent) => void)[] = [];
+  /** Every filter array passed to `query`, in call order (test assertions). */
+  queryFilters: NostrFilter[][] = [];
+  /** Optional override: when set, fully controls what `query` returns/throws. */
+  queryOverride:
+    ((subId: string, filters: NostrFilter[]) => Promise<NostrEvent[]>) | null =
+    null;
   private seq = 0;
 
   async connect(): Promise<void> {}
@@ -111,7 +118,9 @@ class FakeBuzz implements IBuzzClient {
     return { id: subId, close() {} };
   }
 
-  async query(_subId: string, filters: NostrFilter[]): Promise<NostrEvent[]> {
+  async query(subId: string, filters: NostrFilter[]): Promise<NostrEvent[]> {
+    this.queryFilters.push(filters);
+    if (this.queryOverride) return this.queryOverride(subId, filters);
     const kinds = filters[0]?.kinds ?? [];
     if (kinds.includes(39000)) return this.metadata;
     if (kinds.includes(39002)) return this.memberLists;
@@ -160,6 +169,10 @@ function setup(configOver: Partial<Config> = {}) {
   const cm = new ChannelManager(config, identity, buzz, state);
   return { config, identity, buzz, state, cm };
 }
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -445,6 +458,23 @@ describe("re-run triggers (§3)", () => {
     await expect(cm.verifyChannelExists("other")).resolves.toBe(false);
   });
 
+  it("verifyChannelExists scopes the REQ to the UUID via a #d filter (finding H-2)", async () => {
+    const { cm, buzz } = setup();
+    const id = "44444444-0000-5000-8000-000000000000";
+    // A #d-scoped REQ means an empty result is authoritative absence, immune to
+    // the relay's newest-500 cap. Assert the filter, and that an empty set →
+    // false (the relay legitimately returned nothing for this UUID).
+    buzz.queryOverride = async (_subId, filters) => {
+      expect(filters[0]?.["#d"]).toEqual([id]);
+      return [];
+    };
+    await expect(cm.verifyChannelExists(id)).resolves.toBe(false);
+    expect(buzz.queryFilters.at(-1)?.[0]).toMatchObject({
+      kinds: [39000],
+      "#d": [id],
+    });
+  });
+
   it("handleChannelLost clears channelId and re-runs discovery", async () => {
     const { cm, buzz, state } = setup();
     state.state.channelId = "stale-uuid";
@@ -472,34 +502,110 @@ describe("re-run triggers (§3)", () => {
     expect(id).toBe(cm.deterministicChannelId());
     expect(buzz.published.map((e) => e.kind)).toContain(9007);
   });
+});
 
-  it("attachTriggers wires channelLost and authenticated on an emitting client", () => {
-    const { cm } = setup();
-    const wired: string[] = [];
-    cm.attachTriggers({
-      on(event: string) {
-        wired.push(event);
-      },
-    });
-    // `authenticated` is what BuzzClient actually emits after every AUTH;
-    // listening for a `reconnected` event nothing emits silently disabled the
-    // reconnect-side 39000 verification (§3).
-    expect(wired).toEqual(["channelLost", "authenticated"]);
+// --- discovery paging + truncation refusal (finding H-2) -------------------
+
+describe("discovery truncation refusal (finding H-2)", () => {
+  /** A full page (== the relay result cap) of non-matching metadata. */
+  function fullPage(): NostrEvent[] {
+    return Array.from({ length: 500 }, (_, i) =>
+      meta(`d-${String(i)}`, "SomethingElse", 1000 - i),
+    );
+  }
+
+  it("refuses to create when the discovery scan is truncated (page cap hit)", async () => {
+    const { cm, buzz } = setup();
+    // Every page comes back full and never drains → the relay is not honouring
+    // `until`, so absence of a "Services" match is unproven. Creating anyway
+    // would spawn a duplicate empty channel.
+    const page = fullPage();
+    buzz.queryOverride = async () => page;
+
+    await expect(cm.ensureChannel()).rejects.toBeInstanceOf(
+      DiscoveryTruncatedError,
+    );
+    // Critically: NO 9007 create was published on a truncated scan.
+    expect(buzz.published.map((e) => e.kind)).not.toContain(9007);
   });
 
-  it("attachTriggers verifies the channel on a real BuzzClient emit (§3)", async () => {
-    const { cm, buzz, state } = setup();
-    state.state.channelId = "77777777-0000-5000-8000-000000000000";
+  it("still creates when a short page proves the scan genuinely drained", async () => {
+    const { cm, buzz } = setup();
+    // A page shorter than the cap means the relay had nothing more → drained,
+    // so a missing "Services" channel is real and creation is correct.
+    buzz.queryOverride = async () => [
+      meta("dd-1", "SomethingElse", 5),
+      meta("dd-2", "Another", 4),
+    ];
+    const id = await cm.ensureChannel();
+    expect(id).toBe(cm.deterministicChannelId());
+    expect(buzz.published.map((e) => e.kind)).toContain(9007);
+  });
+});
+
+// --- hung-run deadline (finding H-6/M-4) -----------------------------------
+
+describe("ensureChannel deadline (finding H-6/M-4)", () => {
+  it("times out a hung run instead of poisoning every future caller", async () => {
+    vi.useFakeTimers();
+    const { cm, buzz } = setup();
+
+    // The discovery query never resolves → the run hangs past the deadline.
+    buzz.queryOverride = () => new Promise<NostrEvent[]>(() => undefined);
+
+    const first = cm.ensureChannel();
+    const firstSettled = expect(first).rejects.toBeInstanceOf(
+      EnsureChannelTimeoutError,
+    );
+    await vi.advanceTimersByTimeAsync(ENSURE_CHANNEL_DEADLINE_MS + 1);
+    await firstSettled;
+
+    // inFlight must have been cleared: a fresh call starts a NEW run and can
+    // succeed rather than awaiting the dead promise forever.
+    buzz.queryOverride = null;
     buzz.metadata = [];
+    const second = await cm.ensureChannel();
+    expect(second).toBe(cm.deterministicChannelId());
+  });
+});
 
-    // Drive the event name BuzzClient really emits, not a recorder stub.
-    const emitter = new EventEmitter();
-    cm.attachTriggers(emitter);
-    emitter.emit("authenticated");
+// --- membership / profile probe tolerance (finding M-1/M-2) ----------------
 
-    await vi.waitFor(() => {
-      expect(buzz.published.map((e) => e.kind)).toContain(9007);
-    });
-    expect(state.state.channelId).toBe(cm.deterministicChannelId());
+describe("probe query tolerance (finding M-1/M-2)", () => {
+  it("does not abort when the 39002 membership probe times out; joins tolerantly", async () => {
+    const { cm, buzz } = setup();
+    const id = "88888888-0000-5000-8000-000000000000";
+    buzz.metadata = [meta(id, "Services", 5)];
+    // Discovery succeeds; the 39002 membership probe rejects (EOSE timeout).
+    buzz.queryOverride = async (_subId, filters) => {
+      const kinds = filters[0]?.kinds ?? [];
+      if (kinds.includes(39002)) {
+        throw new Error("query chan-members timed out waiting for EOSE");
+      }
+      if (kinds.includes(39000)) return buzz.metadata;
+      return [];
+    };
+
+    const resolved = await cm.ensureChannel();
+    expect(resolved).toBe(id);
+    // Unknown membership → tolerant path: send the (possibly redundant) join.
+    expect(buzz.published.map((e) => e.kind)).toContain(9021);
+  });
+
+  it("does not abort when the kind:0 profile probe times out; publishes anyway", async () => {
+    const { cm, buzz } = setup();
+    // No channel exists (short drained scan) → create path; profile probe fails.
+    buzz.queryOverride = async (_subId, filters) => {
+      const kinds = filters[0]?.kinds ?? [];
+      if (kinds.includes(0)) {
+        throw new Error("query bridge-profile timed out waiting for EOSE");
+      }
+      return [];
+    };
+
+    const resolved = await cm.ensureChannel();
+    expect(resolved).toBe(cm.deterministicChannelId());
+    // The profile is published rather than the daemon aborting startup.
+    expect(buzz.published.map((e) => e.kind)).toContain(0);
   });
 });

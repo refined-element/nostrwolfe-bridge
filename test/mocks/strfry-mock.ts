@@ -30,14 +30,28 @@ interface LiveSub {
   filters: NostrFilter[];
 }
 
+/** A scripted directive applied to the next matching REQ(s) by sub-id prefix. */
+interface ReqScript {
+  prefix: string;
+  remaining: number;
+  /** "closed" answers the REQ with a CLOSED frame; "stall" never responds. */
+  mode: "closed" | "stall";
+  message: string;
+}
+
 export class StrfryMock {
   /** Every REQ the mock has seen, in order. */
   readonly reqs: ObservedReq[] = [];
+  /** Every CLOSE frame the mock has seen, in order. */
+  readonly closes: string[] = [];
+  /** How many TCP connections the mock has accepted (reconnect assertions). */
+  connectionCount = 0;
 
   private readonly events: NostrEvent[] = [];
   private readonly sockets = new Set<WebSocket>();
   private readonly liveSubs: LiveSub[] = [];
   private readonly maxEventsPerReq: number;
+  private readonly scripts: ReqScript[] = [];
 
   private constructor(
     private readonly wss: WebSocketServer,
@@ -82,9 +96,46 @@ export class StrfryMock {
     this.liveSubs.length = 0;
   }
 
-  /** REQs whose sub id matches, for filter-shape assertions. */
+  /** REQs whose sub id matches exactly (e.g. the constant live sub id). */
   reqsFor(subId: string): ObservedReq[] {
     return this.reqs.filter((r) => r.subId === subId);
+  }
+
+  /** REQs whose sub id starts with `prefix` (paged ids are `<prefix>-<page>`). */
+  reqsForPrefix(prefix: string): ObservedReq[] {
+    return this.reqs.filter((r) => r.subId.startsWith(prefix));
+  }
+
+  /** CLOSE frames received for a given sub id. */
+  closesFor(subId: string): string[] {
+    return this.closes.filter((s) => s === subId);
+  }
+
+  /**
+   * Answer the next `count` REQs whose sub id starts with `prefix` with a CLOSED
+   * frame instead of serving them (scripts the §4 relay-refusal path).
+   */
+  closeReqs(
+    prefix: string,
+    count: number,
+    message = "closed: rate-limited",
+  ): void {
+    this.scripts.push({ prefix, remaining: count, mode: "closed", message });
+  }
+
+  /**
+   * Swallow the next `count` REQs whose sub id starts with `prefix` — no EVENT,
+   * no EOSE, no CLOSED — so the client's page timeout fires.
+   */
+  stallReqs(prefix: string, count: number): void {
+    this.scripts.push({ prefix, remaining: count, mode: "stall", message: "" });
+  }
+
+  /** Send a CLOSED frame to every currently-registered live sub with `subId`. */
+  closeLiveSubs(subId: string, message = "closed: rate-limited"): void {
+    for (const sub of this.liveSubs) {
+      if (sub.subId === subId) send(sub.socket, ["CLOSED", sub.subId, message]);
+    }
   }
 
   stop(): Promise<void> {
@@ -95,6 +146,7 @@ export class StrfryMock {
   }
 
   private onConnection(socket: WebSocket): void {
+    this.connectionCount += 1;
     this.sockets.add(socket);
     socket.on("close", () => {
       this.sockets.delete(socket);
@@ -113,6 +165,18 @@ export class StrfryMock {
         const subId = String(frame[1]);
         const filters = frame.slice(2) as NostrFilter[];
         this.reqs.push({ subId, filters });
+        const script = this.scripts.find(
+          (s) => s.remaining > 0 && subId.startsWith(s.prefix),
+        );
+        if (script) {
+          script.remaining -= 1;
+          // "stall" swallows the REQ entirely so the client's timeout fires;
+          // "closed" answers with the §4 relay-refusal frame.
+          if (script.mode === "closed") {
+            send(socket, ["CLOSED", subId, script.message]);
+          }
+          return;
+        }
         for (const event of this.select(filters)) {
           send(socket, ["EVENT", subId, event]);
         }
@@ -123,6 +187,7 @@ export class StrfryMock {
 
       if (frame[0] === "CLOSE") {
         const subId = String(frame[1]);
+        this.closes.push(subId);
         for (let i = this.liveSubs.length - 1; i >= 0; i--) {
           const sub = this.liveSubs[i];
           if (sub && sub.socket === socket && sub.subId === subId) {

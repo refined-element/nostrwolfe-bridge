@@ -46,6 +46,13 @@ export function rateLimitedRetryIn(seconds: number): string {
   return `rate-limited: quota exceeded; retry in ${seconds}s`;
 }
 
+/**
+ * Sentinel an {@link BuzzMockRelay.onEvent} responder can return to model a
+ * relay that accepts the frame but never sends an OK — the head-of-line stall
+ * the publish send-cap defends against (H-5).
+ */
+export const NO_ACK = "__no_ack__" as const;
+
 // ---------------------------------------------------------------------------
 // Scripting
 // ---------------------------------------------------------------------------
@@ -102,6 +109,19 @@ export interface BuzzMockOptions {
    * healthy but the handshake never starts (spec §2).
    */
   withholdAuthChallenge?: boolean;
+  /**
+   * Disable the server's automatic pong reply to client pings — models a
+   * half-open TCP connection where the socket stays OPEN but nothing answers.
+   * Drives the keepalive watchdog (H-1). Default true (normal behavior).
+   */
+  autoPong?: boolean;
+  /**
+   * Hard per-REQ result cap, applied AFTER newest-first ordering, regardless of
+   * the client's `limit` — models the relay's own 500-event ceiling (§4/§7) so
+   * the footer-recovery `until` walk can be exercised across pages. Default
+   * Infinity (no server cap; the client's `limit` still applies).
+   */
+  maxEventsPerReq?: number;
 }
 
 export interface MockConnection {
@@ -138,8 +158,11 @@ export class BuzzMockRelay {
   private closedScript = new Map<string, string>();
   private readonly persistentClosed = new Set<string>();
   private eventResponder:
-    ((event: NostrEvent, ctx: EventContext) => ScriptedOk | undefined) | null =
-    null;
+    | ((
+        event: NostrEvent,
+        ctx: EventContext,
+      ) => ScriptedOk | typeof NO_ACK | undefined)
+    | null = null;
   private authResponder:
     ((event: NostrEvent, ctx: AuthContext) => ScriptedOk | undefined) | null =
     null;
@@ -177,7 +200,11 @@ export class BuzzMockRelay {
   }
 
   static async start(options: BuzzMockOptions = {}): Promise<BuzzMockRelay> {
-    const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    const wss = new WebSocketServer({
+      host: "127.0.0.1",
+      port: 0,
+      autoPong: options.autoPong ?? true,
+    });
     await new Promise<void>((resolve, reject) => {
       wss.once("listening", () => resolve());
       wss.once("error", reject);
@@ -210,9 +237,15 @@ export class BuzzMockRelay {
     return this;
   }
 
-  /** Full control over EVENT replies; return undefined to fall back to the queue. */
+  /**
+   * Full control over EVENT replies; return undefined to fall back to the
+   * queue, or {@link NO_ACK} to accept the frame but send no OK at all.
+   */
   onEvent(
-    fn: (event: NostrEvent, ctx: EventContext) => ScriptedOk | undefined,
+    fn: (
+      event: NostrEvent,
+      ctx: EventContext,
+    ) => ScriptedOk | typeof NO_ACK | undefined,
   ): this {
     this.eventResponder = fn;
     return this;
@@ -417,6 +450,7 @@ export class BuzzMockRelay {
       connection: conn,
     };
     const scripted = this.eventResponder?.(event, ctx) ?? this.okScript.shift();
+    if (scripted === NO_ACK) return; // relay accepts the frame but never OKs it
     const channelAware = this.options.channelAware ?? false;
     const response =
       scripted ??
@@ -535,13 +569,42 @@ export class BuzzMockRelay {
       this.send(conn, ["CLOSED", subId, scripted]);
       return;
     }
-    for (const event of this.stored) {
-      if (matchesAny(event, filters)) this.send(conn, ["EVENT", subId, event]);
+    for (const event of this.selectForReq(filters)) {
+      this.send(conn, ["EVENT", subId, event]);
     }
     if (!this.eoseSuppressed) this.send(conn, ["EOSE", subId]);
     // Stays open past EOSE like a real persistent sub, so later events are
     // pushed to it (see `deliver`).
     this.liveSubs.push({ conn, subId, filters });
+  }
+
+  /**
+   * Relay-faithful REQ selection: each filter's matches are ordered newest-first
+   * (created_at desc, id asc as the deterministic tie-break) and truncated to
+   * `min(filter.limit, maxEventsPerReq)`, then unioned across filters with id
+   * dedupe. This is what lets the footer-recovery `until` walk page correctly —
+   * the previous "emit every stored match in insertion order" ignored `limit`,
+   * so a single page always returned everything and the walk never ran.
+   */
+  private selectForReq(filters: NostrFilter[]): NostrEvent[] {
+    const serverCap = this.options.maxEventsPerReq ?? Infinity;
+    const seen = new Set<string>();
+    const out: NostrEvent[] = [];
+    const source = filters.length === 0 ? [{}] : filters;
+    for (const filter of source as NostrFilter[]) {
+      const hits = this.stored
+        .filter((e) => matches(e, filter))
+        .sort(
+          (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
+        );
+      const cap = Math.min(filter.limit ?? Infinity, serverCap);
+      for (const event of hits.slice(0, cap)) {
+        if (seen.has(event.id)) continue;
+        seen.add(event.id);
+        out.push(event);
+      }
+    }
+    return out;
   }
 
   private closeSub(conn: MockConnection, subId: string): void {

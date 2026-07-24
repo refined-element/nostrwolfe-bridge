@@ -11,6 +11,7 @@ import type {
   IStateStore,
   LogLevel,
   NostrEvent,
+  NostrFilter,
   UnsignedEvent,
 } from "./types.js";
 
@@ -25,6 +26,35 @@ const KIND_JOIN_REQUEST = 9021;
 const KIND_GROUP_METADATA = 39000;
 /** NIP-29 group members (relay-signed; `p` tag per member). */
 const KIND_GROUP_MEMBERS = 39002;
+
+// --- Discovery paging (spec §3 step 1 / finding H-2) -----------------------
+
+/**
+ * Per-page `limit` for the 39000 discovery scan. The relay caps a filter at 500
+ * results (`ARCHITECTURE.md:631-638`); once more than one page of channel
+ * metadata exists, an unpaged `{kinds:[39000]}` REQ silently returns only the
+ * newest 500 and a channel outside that window looks absent. We page with
+ * `until` instead, exactly like footer recovery.
+ */
+const DISCOVER_PAGE_SIZE = 500;
+
+/**
+ * Safety valve on the discovery `until` walk. Hitting it means the relay is not
+ * honouring `until`; we stop and report the scan as **truncated** rather than
+ * looping forever — a truncated scan is not evidence a channel is absent, so
+ * ChannelManager must refuse to create rather than spawn a duplicate channel.
+ */
+const DISCOVER_MAX_PAGES = 100;
+
+/**
+ * Hard ceiling on a single `ensureChannel` run before its memoized `inFlight`
+ * promise is treated as poisoned (finding H-6/M-4). A hung run (a relay that
+ * accepts the socket but never answers a REQ, past the query timeout) would
+ * otherwise leave `inFlight` pending forever, so every future caller awaits a
+ * promise that never settles. The deadline turns that into a rejection the
+ * caller's retry ladder can act on, and frees `inFlight` for a fresh attempt.
+ */
+export const ENSURE_CHANNEL_DEADLINE_MS = 120_000;
 
 // --- Logging ---------------------------------------------------------------
 
@@ -192,17 +222,27 @@ class ChannelVanished extends Error {
   }
 }
 
-/** Duck-typed event source — BuzzClient exposes `on()` if it emits triggers. */
-interface TriggerSource {
-  on(event: string, listener: (...args: unknown[]) => void): unknown;
+/**
+ * The 39000 discovery scan hit {@link DISCOVER_MAX_PAGES} with its last page
+ * still full — the relay is not honouring `until`, so we cannot prove the
+ * channel is absent. Creating anyway would spawn a duplicate empty channel
+ * (finding H-2), so `runEnsureOnce` throws this instead. It is a *retryable*
+ * condition: the caller's re-run ladder retries, and a transient relay hiccup
+ * resolves on the next pass.
+ */
+export class DiscoveryTruncatedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DiscoveryTruncatedError";
+  }
 }
 
-function isTriggerSource(value: unknown): value is TriggerSource {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { on?: unknown }).on === "function"
-  );
+/** A single `ensureChannel` run exceeded {@link ENSURE_CHANNEL_DEADLINE_MS}. */
+export class EnsureChannelTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`ensureChannel did not settle within ${String(ms)}ms`);
+    this.name = "EnsureChannelTimeoutError";
+  }
 }
 
 export class ChannelManager implements IChannelManager {
@@ -232,10 +272,26 @@ export class ChannelManager implements IChannelManager {
   }
 
   async ensureChannel(): Promise<string> {
-    this.inFlight ??= this.runEnsure().finally(() => {
+    // A stuck run must never poison every future caller (finding H-6/M-4): race
+    // the run against a deadline so a hang becomes a rejection, and clear
+    // `inFlight` whichever side wins so the next caller starts a fresh attempt.
+    this.inFlight ??= this.runEnsureWithDeadline().finally(() => {
       this.inFlight = null;
     });
     return this.inFlight;
+  }
+
+  private runEnsureWithDeadline(): Promise<string> {
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new EnsureChannelTimeoutError(ENSURE_CHANNEL_DEADLINE_MS));
+      }, ENSURE_CHANNEL_DEADLINE_MS);
+      if (typeof timer.unref === "function") timer.unref();
+    });
+    return Promise.race([this.runEnsure(), deadline]).finally(() => {
+      if (timer !== undefined) clearTimeout(timer);
+    });
   }
 
   private async runEnsure(): Promise<string> {
@@ -260,12 +316,21 @@ export class ChannelManager implements IChannelManager {
     const deterministic = this.deterministicChannelId();
 
     // 1. Discover.
-    let found = await this.discover(persisted, deterministic);
-    let preExisting = found !== null;
-    let channelId = found?.channelId ?? null;
+    let disc = await this.discover(persisted, deterministic);
+    let preExisting = disc.picked !== null;
+    let channelId = disc.picked?.channelId ?? null;
 
     // 2. Create if absent.
     if (channelId === null) {
+      // A truncated scan is NOT evidence of absence (finding H-2): the relay
+      // capped the discovery window, so the channel may be just past it.
+      // Creating now would spawn a duplicate empty channel. Refuse and let the
+      // re-run ladder retry instead.
+      if (disc.truncated) {
+        throw new DiscoveryTruncatedError(
+          "39000 discovery scan truncated (relay result cap hit); refusing to create a possibly-duplicate channel",
+        );
+      }
       // Persist the client-chosen UUID *before* publishing (§3 step 2): the
       // relay can never hand a UUID back through a client-signed 9007.
       this.state.mutate((s) => {
@@ -294,8 +359,8 @@ export class ChannelManager implements IChannelManager {
         this.log("info", "channel create race lost, re-discovering", {
           message: ok.message,
         });
-        found = await this.discover(persisted, deterministic);
-        channelId = found?.channelId ?? deterministic;
+        disc = await this.discover(persisted, deterministic);
+        channelId = disc.picked?.channelId ?? deterministic;
         preExisting = true;
       } else {
         this.state.mutate((s) => {
@@ -324,8 +389,13 @@ export class ChannelManager implements IChannelManager {
    * false means the stored UUID no longer resolves and `channelId` must be cleared.
    */
   async verifyChannelExists(channelId: string): Promise<boolean> {
+    // Filter by `#d` so absence is authoritative (finding H-2): an unfiltered
+    // `{kinds:[39000]}` REQ returns only the newest ~500 metadata events, so a
+    // channel past that window looks gone, `channelId` gets cleared, and the
+    // bridge creates a NEW empty channel nobody joined. Scoping the REQ to this
+    // one UUID means an empty result set truly means "does not resolve".
     const events = await this.buzz.query("chan-verify", [
-      { kinds: [KIND_GROUP_METADATA] },
+      { kinds: [KIND_GROUP_METADATA], "#d": [channelId] },
     ]);
     return collapseMetadata(events).some((c) => c.channelId === channelId);
   }
@@ -355,41 +425,22 @@ export class ChannelManager implements IChannelManager {
     return this.handleChannelLost();
   }
 
-  /**
-   * Wire both re-run triggers to a BuzzClient that emits them. Duck-typed so the
-   * shared `IBuzzClient` contract (types.ts) does not need an emitter surface.
-   */
-  attachTriggers(source: unknown = this.buzz): void {
-    if (!isTriggerSource(source)) {
-      this.log("warn", "trigger source has no on(); re-run triggers not wired");
-      return;
-    }
-    source.on("channelLost", () => {
-      void this.handleChannelLost().catch((err: unknown) => {
-        this.log("error", "channelLost re-run failed", { err: String(err) });
-      });
-    });
-    // BuzzClient emits `authenticated` after **every** AUTH — initial connect
-    // and every reconnect. There is no `reconnected` event; listening for one
-    // silently disabled the reconnect-side 39000 verification (§3).
-    source.on("authenticated", () => {
-      void this.handleReconnect().catch((err: unknown) => {
-        this.log("error", "reconnect verification failed", {
-          err: String(err),
-        });
-      });
-    });
-  }
-
   // --- internals -----------------------------------------------------------
 
+  /**
+   * Discover the Services channel by name (spec §3 step 1).
+   *
+   * Discovery scans by `name`, not by UUID, so it cannot use a `#d` filter and
+   * must page the whole 39000 set with `until` (finding H-2). The returned
+   * `truncated` flag is true when the relay capped the scan (max pages hit with
+   * a full last page) — the caller must NOT treat a null `picked` under
+   * truncation as "channel absent".
+   */
   private async discover(
     persisted: string | null,
     deterministic: string,
-  ): Promise<ChannelCandidate | null> {
-    const events = await this.buzz.query("chan-disc", [
-      { kinds: [KIND_GROUP_METADATA] },
-    ]);
+  ): Promise<{ picked: ChannelCandidate | null; truncated: boolean }> {
+    const { events, truncated } = await this.scanMetadata();
     const wanted = this.config.channelName.trim();
     const matches = collapseMetadata(events).filter(
       (c) => c.name.trim() === wanted,
@@ -400,15 +451,92 @@ export class ChannelManager implements IChannelManager {
         channelId: picked.channelId,
         candidates: matches.length,
       });
+    } else if (truncated) {
+      this.log("warn", "channel discovery scan truncated; absence unproven", {
+        maxPages: DISCOVER_MAX_PAGES,
+        pageSize: DISCOVER_PAGE_SIZE,
+      });
     }
-    return picked;
+    return { picked, truncated };
+  }
+
+  /**
+   * Page the full 39000 metadata set backwards with `until` (§3 step 1). Ends
+   * on an empty or short page (drained → not truncated); if it exhausts
+   * {@link DISCOVER_MAX_PAGES} with every page full, the relay is ignoring
+   * `until` and the scan is reported truncated.
+   */
+  private async scanMetadata(): Promise<{
+    events: NostrEvent[];
+    truncated: boolean;
+  }> {
+    const all: NostrEvent[] = [];
+    const seenIds = new Set<string>();
+    let until: number | undefined;
+    // Assume truncated until a page proves the scan drained.
+    let truncated = true;
+
+    for (let page = 0; page < DISCOVER_MAX_PAGES; page++) {
+      const filter: NostrFilter = {
+        kinds: [KIND_GROUP_METADATA],
+        limit: DISCOVER_PAGE_SIZE,
+      };
+      if (until !== undefined) filter.until = until;
+
+      const events = await this.buzz.query(`chan-disc-${String(page)}`, [
+        filter,
+      ]);
+      if (events.length === 0) {
+        truncated = false;
+        break;
+      }
+
+      let fresh = 0;
+      let oldest = Number.POSITIVE_INFINITY;
+      for (const ev of events) {
+        if (ev.created_at < oldest) oldest = ev.created_at;
+        if (seenIds.has(ev.id)) continue;
+        seenIds.add(ev.id);
+        fresh++;
+        all.push(ev);
+      }
+
+      // A short page means the relay had nothing more to give → drained.
+      if (events.length < DISCOVER_PAGE_SIZE) {
+        truncated = false;
+        break;
+      }
+      // A full page that was all duplicates (one shared `created_at` window):
+      // step strictly below it to make progress, keeping the walk monotonic.
+      if (fresh === 0) {
+        until = Math.min(oldest, until ?? oldest) - 1;
+        continue;
+      }
+      until = oldest;
+    }
+
+    return { events: all, truncated };
   }
 
   /** Membership via the relay-signed 39002 member list for this channel. */
   private async isMember(channelId: string): Promise<boolean> {
-    const events = await this.buzz.query("chan-members", [
-      { kinds: [KIND_GROUP_MEMBERS], "#d": [channelId] },
-    ]);
+    // The 39002 probe is a best-effort read (finding M-1/M-2): a query
+    // rejection (EOSE timeout / CLOSED) is "unknown", NOT "not a member". If we
+    // let it propagate it would abort startup (`runEnsureOnce` does not catch
+    // it). Treat unknown as "not a member" so we fall through to the tolerant
+    // path — a redundant kind:9021 join, whose `duplicate:` is benign.
+    let events: NostrEvent[];
+    try {
+      events = await this.buzz.query("chan-members", [
+        { kinds: [KIND_GROUP_MEMBERS], "#d": [channelId] },
+      ]);
+    } catch (err) {
+      this.log("warn", "39002 membership probe failed; assuming not a member", {
+        channelId,
+        error: String(err),
+      });
+      return false;
+    }
     for (const ev of events) {
       if (tagValue(ev, "d") !== channelId) continue;
       for (const t of ev.tags) {
@@ -459,9 +587,21 @@ export class ChannelManager implements IChannelManager {
       name: "nostrwolfe-bridge",
       about: this.config.channelAbout,
     };
-    const existing = await this.buzz.query("bridge-profile", [
-      { kinds: [KIND_PROFILE], authors: [this.identity.publicKey], limit: 1 },
-    ]);
+    // The kind:0 readback is best-effort (finding M-1/M-2): a query rejection
+    // (EOSE timeout / CLOSED) must not abort startup. On unknown, fall through
+    // to publishing the profile — a redundant kind:0 is harmless (replaceable
+    // event), whereas a thrown probe would take the whole daemon down.
+    let existing: NostrEvent[] = [];
+    try {
+      existing = await this.buzz.query("bridge-profile", [
+        { kinds: [KIND_PROFILE], authors: [this.identity.publicKey], limit: 1 },
+      ]);
+    } catch (err) {
+      this.log("warn", "kind:0 profile probe failed; publishing profile", {
+        community,
+        error: String(err),
+      });
+    }
     const current = existing[0];
     if (current && profileMatches(current.content, desired)) {
       this.profileEnsuredFor = community;

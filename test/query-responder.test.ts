@@ -411,6 +411,46 @@ describe("find scoring (§6)", () => {
     expect(qr.search("storage")[0]!.price).toBe("— sats");
   });
 
+  it("renders a dialect tier's prose note in find results (spec L-7)", () => {
+    // A dialect listing prices in prose (PriceTier.note). Its card shows that
+    // wording verbatim, so a find result must too — not a bare "—".
+    const { qr, cache } = ctx;
+    const l = listing({
+      d: "shipping",
+      s: ["shipping"],
+      prices: [
+        { amount: "", currency: "", note: "Dynamic (varies by destination)" },
+      ],
+    });
+    cache.set(l.address, l);
+    const result = qr.search("shipping")[0]!;
+    expect(result.price).toBe("Dynamic (varies by destination)");
+    expect(formatResultLine(result)).toContain(
+      "Dynamic (varies by destination)",
+    );
+  });
+
+  it("rejects Number()-parseable but non-decimal amounts (0x10, 1e3) as em dash", () => {
+    // The strict decimal gate must agree with the card side: `Number("0x10")`
+    // is 16 and `Number("1e3")` is 1000, but neither is a price.
+    const { qr, cache } = ctx;
+    const hex = listing({
+      d: "hex",
+      s: ["storage"],
+      prices: [{ amount: "0x10", currency: "sats" }],
+    });
+    const exp = listing({
+      d: "exp",
+      s: ["storage"],
+      prices: [{ amount: "1e3", currency: "sats" }],
+    });
+    cache.set(hex.address, hex);
+    cache.set(exp.address, exp);
+    const byD = new Map(qr.search("storage").map((r) => [r.d, r.price]));
+    expect(byD.get("hex")).toBe("— sats");
+    expect(byD.get("exp")).toBe("— sats");
+  });
+
   it("strips newlines from untrusted fields so a result line cannot forge a footer", () => {
     expect(sanitizeInline("evil\nnw:38400:deadbeef:x")).toBe(
       "evil nw:38400:deadbeef:x",
@@ -521,6 +561,99 @@ describe("reconnect replay guard", () => {
 
     advance(30_000);
     await qr.handleMention(dropped); // replayed after the cooldown expired
+    expect(buzz.published).toHaveLength(1);
+  });
+});
+
+// --- publish rejection (silent-failure H-4) --------------------------------
+
+describe("reply rejected by the relay (silent-failure H-4)", () => {
+  function rejectingSetup() {
+    const config = makeConfig(); // logLevel: "error" — the rejection log emits
+    const identity = makeIdentity();
+    const buzz = new FakeBuzz();
+    const cache = new FakeCache();
+    const cursorSeen: number[] = [];
+    let clock = NOW_MS;
+    const qr = new QueryResponder(
+      config,
+      identity,
+      buzz,
+      cache,
+      () => CHANNEL_ID,
+      {
+        now: () => clock,
+        getCursor: () => 0,
+        onCursorAdvance: (ts) => cursorSeen.push(ts),
+      },
+    );
+    return {
+      qr,
+      buzz,
+      cursorSeen,
+      handled: (qr as unknown as { handled: { has(k: string): boolean } })
+        .handled,
+      advance(ms: number) {
+        clock += ms;
+      },
+    };
+  }
+
+  it("does not record the mention as handled and does not advance the cursor, so it can be retried", async () => {
+    const { qr, buzz, cursorSeen, handled, advance } = rejectingSetup();
+    buzz.ok = { id: "x", ok: false, message: "rate-limited: quota exceeded" };
+
+    const m = mention({ id: "m-reject", content: "@bridge help" });
+    await qr.handleMention(m);
+
+    // The reply was attempted…
+    expect(buzz.published).toHaveLength(1);
+    // …but nothing was committed: not handled, cursor untouched.
+    expect(handled.has("m-reject")).toBe(false);
+    expect(cursorSeen).toEqual([]);
+
+    // Replayed after the cooldown with a healthy relay → the retry succeeds.
+    buzz.ok = null;
+    advance(30_000);
+    await qr.handleMention(m);
+    expect(buzz.published).toHaveLength(2);
+    expect(handled.has("m-reject")).toBe(true);
+    expect(cursorSeen).toEqual([m.created_at]);
+  });
+
+  it("logs the dropped reply at error level naming the sender and relay message", async () => {
+    const { qr, buzz } = rejectingSetup();
+    buzz.ok = { id: "x", ok: false, message: "restricted: not permitted" };
+    const lines: string[] = [];
+    const original = console.log;
+    console.log = (line: string) => lines.push(line);
+    try {
+      await qr.handleMention(
+        mention({
+          id: "m-log",
+          pubkey: "e".repeat(64),
+          content: "@bridge help",
+        }),
+      );
+    } finally {
+      console.log = original;
+    }
+    const errors = lines
+      .map((l) => JSON.parse(l))
+      .filter((o) => o.level === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0].msg).toContain("rejected");
+    expect(errors[0].sender).toBe("e".repeat(64));
+    expect(errors[0].message).toBe("restricted: not permitted");
+  });
+
+  it("still throttles a sender whose reply was rejected (cooldown kept)", async () => {
+    const { qr, buzz } = rejectingSetup();
+    buzz.ok = { id: "x", ok: false, message: "rate-limited" };
+    await qr.handleMention(mention({ id: "r1", content: "@bridge help" }));
+    // Second mention from the same sender inside the 5s window is dropped by the
+    // cooldown even though the first reply failed — no second publish attempt.
+    await qr.handleMention(mention({ id: "r2", content: "@bridge help" }));
     expect(buzz.published).toHaveLength(1);
   });
 });

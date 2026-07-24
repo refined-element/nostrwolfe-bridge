@@ -62,6 +62,20 @@ const DEFAULT_AUTH_CHALLENGE_TIMEOUT_MS = 15_000;
 /** Re-issues of a persistent REQ closed with a non-retryable message. */
 const CLOSED_RESUB_MAX = 3;
 
+/**
+ * Max resends of a single head-of-queue publish before it is dropped. An event
+ * the relay never ACKs (OK timeout → dropConnection → resend → timeout …) would
+ * otherwise sit at `queue[0]` forever and wedge every card and reply behind it.
+ * Counts every attempt — dropped sockets, rate-limit retries, re-AUTH retries —
+ * so no failure mode can loop unboundedly on one item.
+ */
+export const MAX_PUBLISH_SENDS = 5;
+
+/** WS keepalive: send a ping this often once the socket is open (spec §2, H-1). */
+const DEFAULT_PING_INTERVAL_MS = 30_000;
+/** WS keepalive: terminate the socket if no pong arrives within this window. */
+const DEFAULT_PONG_TIMEOUT_MS = 10_000;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -100,6 +114,25 @@ class DisconnectedError extends Error {
   constructor(message = "buzz connection lost before OK") {
     super(message);
     this.name = "DisconnectedError";
+  }
+}
+
+/**
+ * A queued publish was resent {@link MAX_PUBLISH_SENDS} times without ever
+ * being ACKed (the OK never arrived, or every attempt hit a dropped socket).
+ * The item is dropped so it stops blocking every publish queued behind it.
+ */
+export class PublishRetriesExhaustedError extends Error {
+  readonly eventId: string;
+  readonly sends: number;
+
+  constructor(eventId: string, sends: number) {
+    super(
+      `event ${eventId} dropped after ${sends} publish attempts without an OK`,
+    );
+    this.name = "PublishRetriesExhaustedError";
+    this.eventId = eventId;
+    this.sends = sends;
   }
 }
 
@@ -144,6 +177,68 @@ export function createConsoleLogger(level: LogLevel = "info"): Logger {
     info: (m, f) => emit("info", m, f),
     warn: (m, f) => emit("warn", m, f),
     error: (m, f) => emit("error", m, f),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket keepalive / half-open watchdog (spec §2, H-1)
+// ---------------------------------------------------------------------------
+
+export interface HeartbeatOptions {
+  /** How often to send a ping while the socket is OPEN. */
+  intervalMs: number;
+  /** How long to wait for the matching pong before declaring the socket dead. */
+  timeoutMs: number;
+  /** Invoked once when a pong is missed; wire this to terminate + reconnect. */
+  onDead: () => void;
+}
+
+/**
+ * Half-open connection watchdog for a single WebSocket. A TCP connection can go
+ * silent without a FIN — the socket stays `OPEN`, no `close` fires, and every
+ * publish/subscribe hangs indefinitely. This sends an application-level ping
+ * every `intervalMs`; if no `pong` comes back within `timeoutMs`, `onDead` runs
+ * (the client terminates the socket and takes its normal reconnect path).
+ *
+ * Returns a `stop()` that clears the timers and detaches the listener. The
+ * pattern is deliberately self-contained so any other single-socket client
+ * (e.g. the wolfe-subscriber) can keep its own copy without sharing state.
+ */
+export function startHeartbeat(
+  ws: WebSocket,
+  { intervalMs, timeoutMs, onDead }: HeartbeatOptions,
+): () => void {
+  let pongTimer: NodeJS.Timeout | null = null;
+  const clearPong = (): void => {
+    if (pongTimer) {
+      clearTimeout(pongTimer);
+      pongTimer = null;
+    }
+  };
+  const onPong = (): void => clearPong();
+  ws.on("pong", onPong);
+
+  const interval = setInterval(() => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    // A ping is already outstanding; wait for its pong or its deadline.
+    if (pongTimer) return;
+    try {
+      ws.ping();
+    } catch {
+      return;
+    }
+    pongTimer = setTimeout(() => {
+      pongTimer = null;
+      onDead();
+    }, timeoutMs);
+    if (typeof pongTimer.unref === "function") pongTimer.unref();
+  }, intervalMs);
+  if (typeof interval.unref === "function") interval.unref();
+
+  return () => {
+    clearInterval(interval);
+    clearPong();
+    ws.removeListener("pong", onPong);
   };
 }
 
@@ -209,6 +304,21 @@ export class TokenBucket {
 // Hooks / options
 // ---------------------------------------------------------------------------
 
+/**
+ * Tri-state result of the {@link BuzzClientHooks.onNotChannelMember} join hook.
+ *
+ * - `joined` — the kind:9021 join took; retry the publish/REQ.
+ * - `rejected` — a genuine membership refusal; go fatal.
+ * - `unavailable` — the join could not even be *attempted* (e.g. the socket
+ *   flapped mid-reconnect). This is transient: keep the connection alive and
+ *   let the reconnect path retry, rather than misreport a membership problem
+ *   and kill the daemon with "check channel membership".
+ *
+ * `boolean` is accepted for backward compatibility: `true` ≡ `joined`,
+ * `false` ≡ `rejected`.
+ */
+export type ChannelJoinOutcome = "joined" | "rejected" | "unavailable";
+
 export interface BuzzClientHooks {
   /**
    * Post-AUTH hook, run after every successful AUTH (initial connect and every
@@ -224,10 +334,12 @@ export interface BuzzClientHooks {
   onChannelLost?: () => Promise<void> | void;
   /**
    * `restricted: not a channel member` — attempt a kind:9021 join once.
-   * Resolve `true` if the join succeeded (the publish is then retried);
-   * `false`/absent goes fatal (spec Error handling).
+   * Resolve `"joined"`/`true` if the join succeeded (the publish/REQ is then
+   * retried); `"rejected"`/`false`/absent goes fatal; `"unavailable"` when the
+   * join could not be attempted (transient) so the bridge keeps the connection
+   * alive and retries instead of going fatal (spec Error handling).
    */
-  onNotChannelMember?: () => Promise<boolean>;
+  onNotChannelMember?: () => Promise<ChannelJoinOutcome | boolean>;
   /** Unrecoverable condition; also emitted as the `fatal` event. */
   onFatal?: (error: BuzzFatalError) => void;
 }
@@ -246,6 +358,10 @@ export interface BuzzClientOptions {
   queryTimeoutMs?: number;
   /** How long to wait for the relay's proactive AUTH challenge after connect. */
   authChallengeTimeoutMs?: number;
+  /** Keepalive ping cadence once the socket is open (default 30s). */
+  pingIntervalMs?: number;
+  /** Pong deadline before the socket is treated as half-open (default 10s). */
+  pongTimeoutMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -345,12 +461,16 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
   private readonly okTimeoutMs: number;
   private readonly queryTimeoutMs: number;
   private readonly authChallengeTimeoutMs: number;
+  private readonly pingIntervalMs: number;
+  private readonly pongTimeoutMs: number;
   private readonly bucket: TokenBucket;
 
   private ws: WebSocket | null = null;
   private status: Status = "idle";
   /** Armed on socket open, cleared by the inbound AUTH frame (spec §2). */
   private authChallengeTimer: NodeJS.Timeout | null = null;
+  /** Stops the keepalive watchdog for the current socket, if running. */
+  private heartbeatStop: (() => void) | null = null;
 
   /** Challenge for the *current* connection; issued once per connection (spec §2). */
   private challenge: string | null = null;
@@ -398,6 +518,8 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
     this.queryTimeoutMs = options.queryTimeoutMs ?? DEFAULT_QUERY_TIMEOUT_MS;
     this.authChallengeTimeoutMs =
       options.authChallengeTimeoutMs ?? DEFAULT_AUTH_CHALLENGE_TIMEOUT_MS;
+    this.pingIntervalMs = options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS;
+    this.pongTimeoutMs = options.pongTimeoutMs ?? DEFAULT_PONG_TIMEOUT_MS;
     this.bucket = new TokenBucket(config.buzzMsgsPerMin, BURST_PER_SECOND);
   }
 
@@ -454,7 +576,11 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
         joinAttempted: false,
         sends: 0,
       });
-      void this.pump();
+      void this.pump().catch((err: unknown) => {
+        this.log.error("publish pump crashed", {
+          error: (err as Error).message,
+        });
+      });
     });
   }
 
@@ -574,6 +700,9 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
       this.log.debug("buzz socket open; awaiting proactive AUTH challenge", {
         url,
       });
+      // H-1: a half-open TCP connection stays OPEN with no `close` event, so
+      // arm the keepalive watchdog the moment the socket is usable.
+      this.startWatchdog(ws);
       // §2: the relay sends the challenge unprompted. If it never arrives the
       // socket is healthy but useless, and connect() would hang forever.
       this.clearAuthChallengeTimer();
@@ -607,6 +736,7 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
     const wasReady = this.status === "ready";
     if (this.status !== "closed") this.status = "connecting";
     this.clearAuthChallengeTimer();
+    this.stopWatchdog();
     this.challenge = null;
     this.authInFlight = false;
     for (const sub of this.subs.values()) sub.active = false;
@@ -676,8 +806,32 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
     this.authChallengeTimer = null;
   }
 
+  /** Arm the half-open watchdog for `ws`; a missed pong drops the connection. */
+  private startWatchdog(ws: WebSocket): void {
+    this.stopWatchdog();
+    this.heartbeatStop = startHeartbeat(ws, {
+      intervalMs: this.pingIntervalMs,
+      timeoutMs: this.pongTimeoutMs,
+      onDead: () => {
+        if (this.ws !== ws) return;
+        this.log.error("buzz relay missed pong; terminating half-open socket", {
+          pongTimeoutMs: this.pongTimeoutMs,
+        });
+        this.dropConnection("missed pong");
+      },
+    });
+  }
+
+  private stopWatchdog(): void {
+    if (this.heartbeatStop) {
+      this.heartbeatStop();
+      this.heartbeatStop = null;
+    }
+  }
+
   private closeSocket(): void {
     this.clearAuthChallengeTimer();
+    this.stopWatchdog();
     const ws = this.ws;
     this.ws = null;
     if (!ws) return;
@@ -793,7 +947,12 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
         void this.handleClosed(
           subId,
           typeof message === "string" ? message : "",
-        );
+        ).catch((err: unknown) => {
+          this.log.error("CLOSED handler crashed", {
+            subId,
+            error: (err as Error).message,
+          });
+        });
         return;
       }
       case "NOTICE": {
@@ -939,7 +1098,11 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
     const waiters = this.readyWaiters;
     this.readyWaiters = [];
     for (const w of waiters) w.resolve();
-    void this.pump();
+    void this.pump().catch((err: unknown) => {
+      this.log.error("publish pump crashed", {
+        error: (err as Error).message,
+      });
+    });
 
     // Post-AUTH hook: channel verification on every reconnect (§2/§3).
     try {
@@ -1006,6 +1169,28 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
     return this.trySendFrame(JSON.stringify(["REQ", subId, ...filters]));
   }
 
+  /**
+   * Run the kind:9021 join hook and classify the result (spec Error handling,
+   * H-3). A thrown error is logged with its message *and* type — never silently
+   * discarded — and mapped to `unavailable` when it is a transient
+   * {@link DisconnectedError} (a socket flap mid-reconnect) rather than a
+   * membership refusal.
+   */
+  private async attemptChannelJoin(): Promise<ChannelJoinOutcome> {
+    const hook = this.hooks.onNotChannelMember;
+    if (!hook) return "rejected";
+    try {
+      return normalizeJoinOutcome(await hook());
+    } catch (err) {
+      const e = err as Error;
+      this.log.error("channel join hook threw", {
+        error: e.message,
+        type: e.name,
+      });
+      return e instanceof DisconnectedError ? "unavailable" : "rejected";
+    }
+  }
+
   private async startQuery(record: QueryRecord): Promise<void> {
     try {
       await this.waitReady();
@@ -1048,11 +1233,22 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
       return;
     }
     if (message.startsWith(P.notChannelMember)) {
-      const joined =
-        (await this.hooks.onNotChannelMember?.().catch(() => false)) ?? false;
-      if (joined) {
+      const outcome = await this.attemptChannelJoin();
+      if (outcome === "joined") {
         if (sub) this.sendReq(sub);
         else if (query) this.sendReqFrame(query.id, query.filters);
+        return;
+      }
+      if (outcome === "unavailable") {
+        // Transient: the join could not be attempted (e.g. a socket flap during
+        // a reconnect), not a genuine membership refusal. Keep the subscription
+        // alive; the reconnect path re-issues it once AUTH completes. Going
+        // fatal here would kill the daemon on a coincidental socket bounce.
+        this.log.warn(
+          "channel join unavailable; keeping subscription for reconnect",
+          { subId, message },
+        );
+        if (sub) sub.active = false;
         return;
       }
       this.fatal(
@@ -1170,36 +1366,77 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
         } catch {
           return; // closed or fatal; failEverything already settled the queue
         }
-        await this.waitForResume();
-        const wait = this.bucket.tryConsume();
-        if (wait > 0) {
-          await this.delayRaw(wait);
-          continue;
-        }
-        const item = this.queue[0];
-        if (!item) continue;
-
-        let res: OkResult;
+        // `item` is captured outside the body try so the catch can settle it if
+        // an unexpected throw (e.g. a channelLost/onFatal listener) escapes.
+        let item: QueueItem | undefined;
         try {
-          item.sends += 1;
-          res = await this.awaitOk(item.event.id, item.frame);
-        } catch (err) {
-          if (err instanceof DisconnectedError) {
-            // Item stays queued; retried after reconnect (never dropped).
+          await this.waitForResume();
+          const wait = this.bucket.tryConsume();
+          if (wait > 0) {
+            await this.delayRaw(wait);
             continue;
           }
-          this.dequeue(item);
-          item.reject(err as Error);
-          continue;
-        }
+          item = this.queue[0];
+          if (!item) continue;
 
-        if (res.ok) {
-          this.dequeue(item);
-          item.resolve(res);
-          continue;
+          // H-5: bound head-of-line retries. Every attempt increments
+          // `item.sends` (dropped sockets, rate-limit retries, re-AUTH retries),
+          // so an event the relay never ACKs is dropped instead of wedging the
+          // queue forever. Checked before the next send so exactly
+          // MAX_PUBLISH_SENDS attempts are made.
+          if (item.sends >= MAX_PUBLISH_SENDS) {
+            this.dequeue(item);
+            const exhausted = new PublishRetriesExhaustedError(
+              item.event.id,
+              item.sends,
+            );
+            this.log.error(
+              "publish dropped after exhausting resends; unblocking queue",
+              {
+                eventId: item.event.id,
+                kind: item.event.kind,
+                sends: item.sends,
+                queueLength: this.queue.length,
+              },
+            );
+            item.reject(exhausted);
+            continue;
+          }
+
+          let res: OkResult;
+          try {
+            item.sends += 1;
+            res = await this.awaitOk(item.event.id, item.frame);
+          } catch (err) {
+            if (err instanceof DisconnectedError) {
+              // Item stays queued; retried after reconnect, capped above.
+              continue;
+            }
+            this.dequeue(item);
+            item.reject(err as Error);
+            continue;
+          }
+
+          if (res.ok) {
+            this.dequeue(item);
+            item.resolve(res);
+            continue;
+          }
+          const action = await this.handleOkFailure(item, res);
+          if (action === "settled") this.dequeue(item);
+        } catch (err) {
+          // An unexpected throw must not escape as an unhandled rejection (which
+          // can kill the daemon) nor strand the in-flight item unsettled.
+          this.log.error("publish pump iteration threw; settling item", {
+            error: (err as Error).message,
+            eventId: item?.event.id,
+            queueLength: this.queue.length,
+          });
+          if (item) {
+            this.dequeue(item);
+            item.reject(err as Error);
+          }
         }
-        const action = await this.handleOkFailure(item, res);
-        if (action === "settled") this.dequeue(item);
       }
     } finally {
       this.pumping = false;
@@ -1208,7 +1445,11 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
         this.status === "ready" &&
         !this.fatalError
       ) {
-        void this.pump();
+        void this.pump().catch((err: unknown) => {
+          this.log.error("publish pump crashed", {
+            error: (err as Error).message,
+          });
+        });
       }
     }
   }
@@ -1251,15 +1492,15 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
     if (msg.startsWith(P.notChannelMember)) {
       if (!item.joinAttempted && this.hooks.onNotChannelMember) {
         item.joinAttempted = true;
-        const joined = await this.hooks
-          .onNotChannelMember()
-          .catch((err: unknown) => {
-            this.log.error("channel join hook threw", {
-              error: (err as Error).message,
-            });
-            return false;
-          });
-        if (joined) return "retry";
+        const outcome = await this.attemptChannelJoin();
+        if (outcome === "joined") return "retry";
+        if (outcome === "unavailable") {
+          // Transient: the join could not be attempted (socket flap). Don't go
+          // fatal and don't burn the single join attempt — retry the publish;
+          // the per-item send cap (MAX_PUBLISH_SENDS) bounds the loop.
+          item.joinAttempted = false;
+          return "retry";
+        }
       }
       this.fatal(
         `publish rejected: ${msg}`,
@@ -1443,13 +1684,32 @@ function isVerificationFailed(message: string): boolean {
   return message.startsWith(P.verificationFailed);
 }
 
-function isNostrEvent(value: unknown): value is NostrEvent {
+/** Map the backward-compatible boolean form onto the tri-state outcome. */
+function normalizeJoinOutcome(
+  value: ChannelJoinOutcome | boolean,
+): ChannelJoinOutcome {
+  if (value === true) return "joined";
+  if (value === false) return "rejected";
+  return value;
+}
+
+/**
+ * Structural admission check for an untrusted inbound event frame. Mirrors the
+ * wolfe-side `asNostrEvent`, including the finite-`created_at` guard (L-5).
+ */
+export function isNostrEvent(value: unknown): value is NostrEvent {
   if (typeof value !== "object" || value === null) return false;
   const e = value as Record<string, unknown>;
   return (
     typeof e["id"] === "string" &&
     typeof e["pubkey"] === "string" &&
     typeof e["kind"] === "number" &&
+    // created_at must be a finite number, matching the wolfe-side
+    // asNostrEvent: a missing/NaN created_at otherwise makes the staleness
+    // gate (`now − created_at > 3600`) evaluate NaN > 3600 → false, so a stale
+    // or malformed mention is treated as fresh (L-5).
+    typeof e["created_at"] === "number" &&
+    Number.isFinite(e["created_at"]) &&
     typeof e["content"] === "string" &&
     typeof e["sig"] === "string" &&
     Array.isArray(e["tags"])

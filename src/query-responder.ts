@@ -2,6 +2,8 @@
 
 import { finalizeEvent } from "nostr-tools/pure";
 
+import { sanitizeInline } from "./sanitize.js";
+
 import type {
   BridgeCommand,
   BridgeIdentity,
@@ -40,9 +42,6 @@ const SCORE_SUBSTRING = 1;
 const HANDLED_MAX = 2_000;
 /** Bound on {@link QueryResponder.helpedThreads} (once-per-thread help, §6). */
 const HELPED_THREADS_MAX = 1_000;
-
-/** The bridge's own command grammar; never re-emit it from untrusted text. */
-const BRIDGE_COMMAND = /@bridge\b/i;
 
 /** Insertion-ordered bounded set: oldest entries evicted first. */
 class BoundedSet {
@@ -128,24 +127,28 @@ export function threadIdOf(event: NostrEvent): string {
   return firstE ?? event.id;
 }
 
-/**
- * Strip control characters/newlines from untrusted text rendered inline, and
- * cut it at the bridge command grammar so a `find` reply can never re-emit a
- * syntactically valid `@bridge …` command into a channel read by LLM-driven
- * buzz-agents (Security §2).
- */
-export function sanitizeInline(text: string, max = 120): string {
-  let s = text.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ");
-  const cmd = s.search(BRIDGE_COMMAND);
-  if (cmd >= 0) s = s.slice(0, cmd);
-  const cleaned = s.replace(/\s+/g, " ").trim();
-  return cleaned.length > max ? `${cleaned.slice(0, max - 1)}…` : cleaned;
-}
+// `sanitizeInline` now lives in ./sanitize.js — the one hardened sanitizer
+// shared with mirror-engine (Security §2). Re-exported so existing importers of
+// this name from query-responder keep working.
+export { sanitizeInline };
 
-/** One-line price summary; non-numeric amounts render as `—` (§ security 2). */
+/**
+ * One-line price summary for `find` results; non-numeric amounts render as `—`
+ * (§ security 2).
+ *
+ * A dialect tier may price in prose ({@link PriceTier.note}, e.g. "Dynamic
+ * (varies by destination)"). The card renders that note verbatim (sanitized) in
+ * place of the structured form, so this summary must too — otherwise the same
+ * listing shows the publisher's wording on its card but a bare `—` in find
+ * results (spec L-7). The numeric gate is the strict decimal regex shared with
+ * the card side: `Number()` would accept `0x10`/`1e3`/`Infinity` as "numbers",
+ * which is not what a price is.
+ */
 export function formatPriceSummary(listing: ParsedListing): string {
   const tier = listing.prices[0];
   if (!tier) return "—";
+  const note = sanitizeInline(tier.note ?? "", 64);
+  if (note.length > 0) return note;
   const amount = /^\d+(\.\d+)?$/.test(tier.amount.trim())
     ? tier.amount.trim()
     : "—";
@@ -296,9 +299,12 @@ export class QueryResponder implements IQueryResponder {
   }
 
   async handleMention(event: NostrEvent): Promise<void> {
-    this.options.onCursorAdvance?.(event.created_at);
-
-    if (!isAddressedToBridge(event, this.identity.publicKey)) return;
+    if (!isAddressedToBridge(event, this.identity.publicKey)) {
+      // Not a mention: nothing to publish, but the cursor still advances so it
+      // tracks the channel head and the reconnect replay window stays bounded.
+      this.options.onCursorAdvance?.(event.created_at);
+      return;
+    }
 
     // Every reconnect re-issues the mentions REQ with `since = cursor − 300`
     // (§2), so the relay replays up to 5 minutes of channel messages. Without
@@ -310,9 +316,6 @@ export class QueryResponder implements IQueryResponder {
       });
       return;
     }
-    // Recorded before the staleness/cooldown gates: a decision *was* made about
-    // this event, so a replay must not re-litigate it.
-    this.handled.add(event.id);
     this.pruneCooldowns();
 
     const nowSec = Math.floor(this.now() / 1000);
@@ -321,6 +324,9 @@ export class QueryResponder implements IQueryResponder {
         id: event.id,
         ageSeconds: nowSec - event.created_at,
       });
+      // A decision *was* made — the mention is too old to ever answer — so
+      // record it (and advance the cursor) to keep replays from re-litigating.
+      this.recordHandled(event);
       return;
     }
 
@@ -330,11 +336,18 @@ export class QueryResponder implements IQueryResponder {
         id: event.id,
         sender: event.pubkey,
       });
+      // Deliberately dropped — record it so a replay does not re-answer it.
+      this.recordHandled(event);
       return;
     }
 
     const command = this.parseCommand(event.content);
     let reply: string;
+    // For a first-time unknown command the thread is committed to
+    // `helpedThreads` only *after* the help actually publishes — otherwise a
+    // failed publish would mark the thread helped, and the retry (see below)
+    // would go silent and never deliver the help it owes.
+    let markHelpedThread: string | undefined;
     if (command.type === "find") {
       const results = this.search(command.query);
       reply =
@@ -349,13 +362,35 @@ export class QueryResponder implements IQueryResponder {
         this.log("debug", "unknown command already helped in thread", {
           thread,
         });
+        this.recordHandled(event);
         return;
       }
-      this.helpedThreads.add(thread);
+      markHelpedThread = thread;
       reply = HELP_TEXT;
     }
 
-    await this.reply(event, reply);
+    const published = await this.reply(event, reply);
+    if (!published) {
+      // The relay rejected the reply. Leave the mention OUT of `handled` and do
+      // NOT advance the cursor, so a reconnect within the 300s replay window
+      // re-delivers it and we retry. The cooldown set inside reply() still
+      // throttles a sender whose replies keep bouncing. (§6, silent-failure H-4)
+      return;
+    }
+    if (markHelpedThread !== undefined)
+      this.helpedThreads.add(markHelpedThread);
+    this.recordHandled(event);
+  }
+
+  /**
+   * Mark a mention finally dealt with: add it to the replay-dedupe set and
+   * advance the buzz cursor to its `created_at`. Called only once the outcome is
+   * settled — a successful publish or a deliberate no-reply — never for a
+   * mention whose reply the relay rejected (that stays retriable).
+   */
+  private recordHandled(event: NostrEvent): void {
+    this.handled.add(event.id);
+    this.options.onCursorAdvance?.(event.created_at);
   }
 
   /**
@@ -420,8 +455,18 @@ export class QueryResponder implements IQueryResponder {
     return scored.slice(0, MAX_RESULTS).map((s) => s.result);
   }
 
-  /** Threaded kind:9 reply: `["h",uuid]` + NIP-10 `["e",parent,"","reply"]` (§6). */
-  private async reply(parent: NostrEvent, content: string): Promise<void> {
+  /**
+   * Threaded kind:9 reply: `["h",uuid]` + NIP-10 `["e",parent,"","reply"]` (§6).
+   *
+   * Returns `true` only if the relay accepted the event. On rejection
+   * (rate-limited / invalid / restricted) it logs at `error` — a dropped reply
+   * is a user-visible failure, not a warning — naming the consequence and the
+   * relay's message, and returns `false` so the caller leaves the mention
+   * unhandled and retriable (silent-failure H-4). The cooldown is set
+   * regardless of outcome so a sender whose replies keep bouncing is still
+   * throttled and cannot spin the bridge.
+   */
+  private async reply(parent: NostrEvent, content: string): Promise<boolean> {
     this.cooldowns.set(parent.pubkey, this.now());
     const event = finalizeEvent(
       {
@@ -437,10 +482,17 @@ export class QueryResponder implements IQueryResponder {
     ) as NostrEvent;
     const ok = await this.buzz.publish(event);
     if (!ok.ok) {
-      this.log("warn", "reply rejected", {
-        parent: parent.id,
-        message: ok.message,
-      });
+      this.log(
+        "error",
+        "reply rejected by relay; mention left unhandled, will retry within the 300s replay window",
+        {
+          parent: parent.id,
+          sender: parent.pubkey,
+          message: ok.message,
+        },
+      );
+      return false;
     }
+    return true;
   }
 }
