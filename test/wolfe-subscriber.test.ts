@@ -5,7 +5,7 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { WolfeSubscriber } from "../src/wolfe-subscriber.js";
+import { asNostrEvent, WolfeSubscriber } from "../src/wolfe-subscriber.js";
 import { StrfryMock } from "./mocks/strfry-mock.js";
 import type { Config, NostrEvent } from "../src/types.js";
 
@@ -160,6 +160,72 @@ describe("WolfeSubscriber.hydrate (§4 startup hydration)", () => {
     expect(new Set(seen.map((e) => e.id)).size).toBe(30);
   });
 
+  it("keeps paging past a page saturated by a single `created_at`", async () => {
+    // `until` is inclusive, so a full page whose events all share one second
+    // returns the identical set forever. Treating that as "drained" silently
+    // truncated hydration and lost every older listing (§4).
+    relay = await StrfryMock.start();
+    for (let i = 0; i < 10; i++) relay.add(listing(i, 1000));
+    for (let i = 10; i < 15; i++) relay.add(listing(i, 900));
+
+    subscriber = new WolfeSubscriber(
+      baseConfig(relay.url, { backfillLimit: 10, mirrorMaxListings: 1000 }),
+      () => 0,
+      { minBackoffMs: 5 },
+    );
+
+    const seen: NostrEvent[] = [];
+    await subscriber.hydrate((e) => {
+      seen.push(e);
+    });
+
+    // All five events below the saturated second are still hydrated.
+    expect(new Set(seen.map((e) => e.id)).size).toBe(15);
+  });
+
+  it("counts the mirror's tracked addresses against the cap, not every address seen", async () => {
+    // §1: `MIRROR_MAX_LISTINGS` caps addresses *tracked*. Counting every
+    // address hydration sees lets a narrow `MIRROR_CATEGORIES` spend the whole
+    // cap on listings the client-side filter immediately discards.
+    relay = await StrfryMock.start();
+    for (let i = 0; i < 30; i++) {
+      relay.add(listing(i, 2000 - i, i % 10 === 0 ? `keep-${i}` : `drop-${i}`));
+    }
+
+    const tracked = new Set<string>();
+    subscriber = new WolfeSubscriber(
+      baseConfig(relay.url, { backfillLimit: 10, mirrorMaxListings: 3 }),
+      () => 0,
+      { minBackoffMs: 5, trackedCount: () => tracked.size },
+    );
+
+    await subscriber.hydrate((e) => {
+      const d = e.tags.find((t) => t[0] === "d")?.[1] ?? "";
+      if (d.startsWith("keep-")) tracked.add(d);
+    });
+
+    // All three matching listings are mirrored even though 20+ non-matching
+    // addresses passed through first.
+    expect(tracked.size).toBe(3);
+  });
+
+  it("survives a listener that throws instead of aborting the whole run", async () => {
+    relay = await StrfryMock.start();
+    for (let i = 0; i < 5; i++) relay.add(listing(i, 1000 + i));
+
+    subscriber = new WolfeSubscriber(baseConfig(relay.url), () => 0, {
+      minBackoffMs: 5,
+    });
+
+    const seen: string[] = [];
+    await subscriber.hydrate((e) => {
+      seen.push(e.id);
+      if (seen.length === 2) throw new Error("boom");
+    });
+
+    expect(seen).toHaveLength(5);
+  });
+
   it("only counts distinct addresses, not events, against the cap", async () => {
     relay = await StrfryMock.start();
     // Three replacements of the same address plus two other addresses.
@@ -183,6 +249,32 @@ describe("WolfeSubscriber.hydrate (§4 startup hydration)", () => {
       "other-a",
       "other-b",
     ]);
+  });
+});
+
+describe("relay frame admission (Security §2)", () => {
+  it("rejects half-formed events instead of letting them reach the mirror", () => {
+    // The exact PoC frame: `["EVENT","wolfe-hydrate",{"id":"aa"}]`. Admitting
+    // it made hydration throw on `event.tags.find(...)`, and since hydration
+    // re-runs from scratch every startup that is a crash loop the open,
+    // unauthenticated relay can trigger at will.
+    expect(asNostrEvent({ id: "aa" })).toBeNull();
+    expect(asNostrEvent(null)).toBeNull();
+    expect(asNostrEvent("nope")).toBeNull();
+
+    const good = listing(1, 1000);
+    expect(asNostrEvent(good)).toBe(good);
+
+    expect(asNostrEvent({ ...good, tags: undefined })).toBeNull();
+    expect(asNostrEvent({ ...good, tags: [["d", 7]] })).toBeNull();
+    expect(asNostrEvent({ ...good, tags: ["d"] })).toBeNull();
+    expect(asNostrEvent({ ...good, created_at: undefined })).toBeNull();
+    expect(asNostrEvent({ ...good, created_at: "soon" })).toBeNull();
+    expect(asNostrEvent({ ...good, kind: "38400" })).toBeNull();
+    expect(asNostrEvent({ ...good, content: undefined })).toBeNull();
+    expect(asNostrEvent({ ...good, sig: undefined })).toBeNull();
+    expect(asNostrEvent({ ...good, id: "short" })).toBeNull();
+    expect(asNostrEvent({ ...good, pubkey: "nothex" })).toBeNull();
   });
 });
 
@@ -253,5 +345,50 @@ describe("WolfeSubscriber.subscribeLive (§4 live subscription)", () => {
     expect(relay.reqsFor("wolfe-38400")[1]!.filters[0]!.since).toBeTypeOf(
       "number",
     );
+  });
+
+  it("recovers when a disconnect lands while a reconnect is still draining", async () => {
+    // The listener chain is publish-rate-limited in production, so draining a
+    // gap takes minutes — long enough for a second disconnect to land inside
+    // it. That second reconnect used to hit the `resuming` guard, get dropped,
+    // and leave the live sub permanently dead: no socket, no pending attempt,
+    // silent loss of all mirroring (§4 "infinite retries").
+    relay = await StrfryMock.start({ maxEventsPerReq: 5 });
+
+    let cursor = 0;
+    let slow = false;
+    subscriber = new WolfeSubscriber(baseConfig(relay.url), () => cursor, {
+      minBackoffMs: 5,
+      maxBackoffMs: 20,
+    });
+
+    const seen: NostrEvent[] = [];
+    subscriber.subscribeLive(async (e) => {
+      seen.push(e);
+      cursor = Math.max(cursor, e.created_at);
+      if (slow) await new Promise((r) => setTimeout(r, 40));
+    });
+    await waitFor(() => relay!.reqsFor("wolfe-38400").length === 1);
+
+    // First disconnect: 20 events to drain through a deliberately slow listener.
+    slow = true;
+    relay.dropConnections();
+    for (let i = 0; i < 20; i++) relay.add(listing(i, 2000 + i));
+
+    // Second disconnect, landing strictly inside `await this.queue`: every
+    // drain page is already on the wire, but the slow listener is still
+    // chewing through them.
+    await waitFor(() => relay!.reqsFor("wolfe-drain").length >= 4, 10_000);
+    await waitFor(() => seen.length >= 2, 10_000);
+    expect(seen.length).toBeLessThan(20);
+    relay.dropConnections();
+
+    // The live sub must come back and deliver new events again.
+    await waitFor(() => relay!.reqsFor("wolfe-38400").length >= 2, 10_000);
+    slow = false;
+    await waitFor(() => new Set(seen.map((e) => e.id)).size >= 20, 10_000);
+
+    relay.broadcast(listing(500, 9_000));
+    await waitFor(() => seen.some((e) => e.created_at === 9_000), 10_000);
   });
 });

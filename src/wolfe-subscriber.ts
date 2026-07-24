@@ -32,7 +32,20 @@ export interface WolfeSubscriberOptions {
   pageTimeoutMs?: number;
   /** Retries for a single page before giving up on the hydration/drain run. */
   pageRetries?: number;
+  /**
+   * Live count of addresses actually **tracked** by the mirror (spec §1 defines
+   * `MIRROR_MAX_LISTINGS` as a cap on tracked addresses). Without it, hydration
+   * counts every address it sees — including ones MirrorEngine's client-side
+   * category filter then discards — so a narrow `MIRROR_CATEGORIES` would let
+   * the cap be consumed by listings that are never mirrored (Open question 5).
+   */
+  trackedCount?: () => number;
+  /** Safety valve on the `until` walk when `trackedCount` never reaches the cap. */
+  maxPages?: number;
 }
+
+/** Default ceiling on hydration/drain pages; see {@link WolfeSubscriberOptions.maxPages}. */
+export const DEFAULT_MAX_PAGES = 200;
 
 // ---------------------------------------------------------------------------
 // Logging (plain stdout JSON lines, spec §1 LOG_LEVEL)
@@ -61,6 +74,8 @@ export class WolfeSubscriber implements IWolfeSubscriber {
   private readonly maxBackoffMs: number;
   private readonly pageTimeoutMs: number;
   private readonly pageRetries: number;
+  private readonly trackedCount: (() => number) | null;
+  private readonly maxPages: number;
 
   private ws: WebSocket | null = null;
   private connecting: Promise<WebSocket> | null = null;
@@ -73,6 +88,13 @@ export class WolfeSubscriber implements IWolfeSubscriber {
   private liveListener: Listener | null = null;
   private liveSince = 0;
   private resuming = false;
+  /**
+   * A reconnect arrived while {@link openLive} was already running. Dropping it
+   * (the old `if (this.resuming) return;`) permanently killed the live sub
+   * whenever a disconnect landed during the multi-minute gap drain, so the
+   * attempt is coalesced and re-dispatched by `openLive`'s `finally` instead.
+   */
+  private pendingReconnect = false;
   /** Serializes async listener invocations so events are processed in order. */
   private queue: Promise<void> = Promise.resolve();
 
@@ -86,6 +108,8 @@ export class WolfeSubscriber implements IWolfeSubscriber {
     this.maxBackoffMs = opts.maxBackoffMs ?? 60_000;
     this.pageTimeoutMs = opts.pageTimeoutMs ?? 30_000;
     this.pageRetries = opts.pageRetries ?? 5;
+    this.trackedCount = opts.trackedCount ?? null;
+    this.maxPages = opts.maxPages ?? DEFAULT_MAX_PAGES;
   }
 
   // -------------------------------------------------------------------------
@@ -106,8 +130,10 @@ export class WolfeSubscriber implements IWolfeSubscriber {
     const seenIds = new Set<string>();
     const addresses = new Set<string>();
     let until: number | undefined;
+    let atCap = false;
+    let page = 0;
 
-    for (;;) {
+    for (; page < this.maxPages; page++) {
       if (this.stopped) return;
       const filter: NostrFilter = { kinds: [LISTING_KIND], limit };
       // Deliberately no `since` — hydration is cursor-independent (§4).
@@ -118,17 +144,32 @@ export class WolfeSubscriber implements IWolfeSubscriber {
 
       let fresh = 0;
       let oldest = Number.POSITIVE_INFINITY;
-      let atCap = false;
 
       for (const event of events) {
-        if (event.created_at < oldest) oldest = event.created_at;
+        if (typeof event.created_at === "number" && event.created_at < oldest) {
+          oldest = event.created_at;
+        }
         if (seenIds.has(event.id)) continue;
         seenIds.add(event.id);
         fresh++;
-        await onListing(event);
-        const address = addressOfEvent(event);
-        if (address !== null) addresses.add(address);
-        if (addresses.size >= maxAddresses) {
+        // The relay is untrusted and unauthenticated: one malformed frame must
+        // never abort hydration (which re-runs from scratch every startup, so
+        // an abort here is a crash loop the open relay can trigger, §4/sec §2).
+        try {
+          await onListing(event);
+          const address = addressOfEvent(event);
+          if (address !== null) addresses.add(address);
+        } catch (err) {
+          this.log("debug", "hydration listener failed for 38400", {
+            id: event.id,
+            error: String(err),
+          });
+        }
+        // §1: the cap counts addresses actually *tracked*. `trackedCount` is
+        // the mirror's own tally (post category filter); the seen-address set
+        // is only the fallback when no counter is wired in.
+        const tracked = this.trackedCount?.() ?? addresses.size;
+        if (tracked >= maxAddresses) {
           atCap = true;
           break;
         }
@@ -137,19 +178,58 @@ export class WolfeSubscriber implements IWolfeSubscriber {
       if (atCap) {
         this.log("warn", "hydration stopped at MIRROR_MAX_LISTINGS", {
           addresses: addresses.size,
+          tracked: this.trackedCount?.() ?? addresses.size,
         });
         break;
       }
+
+      const next = this.nextUntil(events, fresh, oldest, limit, until);
       // A relay may cap a page below `limit`, so page-shortness is NOT a drain
-      // signal (§4); only an empty page or a page with no new ids ends paging.
-      if (fresh === 0) break;
-      until = oldest;
+      // signal (§4); only an empty page or a genuinely exhausted window ends it.
+      if (next === null) break;
+      until = next;
+    }
+
+    if (page >= this.maxPages) {
+      this.log("warn", "hydration stopped at the page ceiling", {
+        maxPages: this.maxPages,
+        addresses: addresses.size,
+      });
     }
 
     this.log("info", "hydration complete", {
       events: seenIds.size,
       addresses: addresses.size,
     });
+  }
+
+  /**
+   * Next `until` for a backwards page walk, or null when the window is drained.
+   *
+   * `until` is inclusive, so the normal step is `until = oldest`. If a full page
+   * yielded no new ids, every event at `oldest` that the relay is willing to
+   * return has been consumed and repeating `until = oldest` would spin on the
+   * same set forever — the walk steps to `oldest − 1` instead. (A page of
+   * `limit` events all sharing one `created_at` is realistic for the automated
+   * bulk publishers §5's same-second tie-break exists for.)
+   */
+  private nextUntil(
+    events: NostrEvent[],
+    fresh: number,
+    oldest: number,
+    limit: number,
+    previousUntil: number | undefined,
+  ): number | null {
+    if (!Number.isFinite(oldest)) return null;
+    // Progress was made; re-request inclusively so nothing at `oldest` is lost.
+    // Termination is guaranteed because the seen-id set only ever grows.
+    if (fresh > 0) return oldest;
+    // No new ids: only a *full* page can still be hiding events below `oldest`.
+    if (events.length < limit) return null;
+    // Step strictly below the window we just asked for. `Math.min` with the
+    // previous `until` keeps the walk monotonic even against a relay that
+    // ignores `until` and replays the same newest-first page.
+    return Math.min(oldest, previousUntil ?? oldest) - 1;
   }
 
   // -------------------------------------------------------------------------
@@ -170,8 +250,13 @@ export class WolfeSubscriber implements IWolfeSubscriber {
 
   private async openLive(isReconnect: boolean): Promise<void> {
     if (this.stopped || this.liveListener === null) return;
-    if (this.resuming) return;
+    if (this.resuming) {
+      // Coalesce: the in-flight attempt re-dispatches from its `finally`.
+      this.pendingReconnect = true;
+      return;
+    }
     this.resuming = true;
+    let failed = false;
     try {
       await this.ensureOpen();
       if (isReconnect) {
@@ -179,19 +264,35 @@ export class WolfeSubscriber implements IWolfeSubscriber {
         // response, drain the window by paging with `until` before resuming.
         await this.drainGap(Math.max(0, this.getCursor() - CURSOR_SKEW));
         // Let the drained events settle so the cursor reflects them before the
-        // live window is computed.
+        // live window is computed. This can take minutes (the listener chain is
+        // publish-rate-limited), which is exactly when a socket drop lands here.
         await this.queue;
+        // The socket may have died during that wait; re-establish before REQ.
+        await this.ensureOpen();
       }
       const since = Math.max(0, this.getCursor() - CURSOR_SKEW);
       this.liveSince = since;
       this.send(["REQ", SUB_LIVE, { kinds: [LISTING_KIND], since }]);
+      // §4 backoff parity with BuzzClient: the attempt counter resets on a
+      // *useful* connection (live REQ on the wire), not on mere TCP open —
+      // otherwise a relay that accepts and immediately closes is hammered at
+      // sub-second intervals and the 60s ceiling is never reached.
+      this.attempt = 0;
       this.log("info", "live subscription open", { since, isReconnect });
     } catch (err) {
+      failed = true;
       this.log("error", "failed to open live subscription", {
         error: String(err),
       });
     } finally {
       this.resuming = false;
+      const retry = this.pendingReconnect || failed;
+      this.pendingReconnect = false;
+      // Never leave the live sub with no socket and no pending attempt: that is
+      // a silent, permanent stop to all mirroring (§4 "infinite retries").
+      if (retry && !this.stopped && this.liveListener !== null) {
+        void this.reconnectLive();
+      }
     }
   }
 
@@ -204,7 +305,7 @@ export class WolfeSubscriber implements IWolfeSubscriber {
     const seenIds = new Set<string>();
     let until: number | undefined;
 
-    for (;;) {
+    for (let page = 0; page < this.maxPages; page++) {
       if (this.stopped) return;
       const filter: NostrFilter = { kinds: [LISTING_KIND], since, limit };
       if (until !== undefined) filter.until = until;
@@ -215,15 +316,18 @@ export class WolfeSubscriber implements IWolfeSubscriber {
       let fresh = 0;
       let oldest = Number.POSITIVE_INFINITY;
       for (const event of events) {
-        if (event.created_at < oldest) oldest = event.created_at;
+        if (typeof event.created_at === "number" && event.created_at < oldest) {
+          oldest = event.created_at;
+        }
         if (seenIds.has(event.id)) continue;
         seenIds.add(event.id);
         fresh++;
         this.enqueue(event);
       }
-      if (fresh === 0) break;
-      if (oldest <= since) break;
-      until = oldest;
+      const next = this.nextUntil(events, fresh, oldest, limit, until);
+      if (next === null) break;
+      if (next < since) break;
+      until = next;
     }
 
     if (seenIds.size > 0) {
@@ -246,6 +350,9 @@ export class WolfeSubscriber implements IWolfeSubscriber {
     this.connecting = null;
     if (ws) {
       ws.removeAllListeners();
+      // `ws` rethrows an `error` event that has no listener, and a socket torn
+      // down mid-handshake still emits one asynchronously.
+      ws.on("error", () => undefined);
       try {
         ws.close();
       } catch {
@@ -290,7 +397,7 @@ export class WolfeSubscriber implements IWolfeSubscriber {
         opened = true;
         this.ws = ws;
         this.connecting = null;
-        this.attempt = 0;
+        // NB: `attempt` is deliberately NOT reset here — see openLive().
         resolve(ws);
       });
 
@@ -371,8 +478,15 @@ export class WolfeSubscriber implements IWolfeSubscriber {
     const [type, subId] = frame as [string, string];
     switch (type) {
       case "EVENT": {
-        const event = frame[2] as NostrEvent | undefined;
-        if (!event || typeof event.id !== "string") return;
+        // The wolfe relay is open and unauthenticated, so a frame is only
+        // admitted once its full shape checks out — a half-formed event would
+        // otherwise throw deep inside hydration, which re-runs from scratch on
+        // every startup and would therefore crash-loop the daemon (Security §2).
+        const event = asNostrEvent(frame[2]);
+        if (event === null) {
+          this.log("debug", "dropping malformed event frame", { subId });
+          return;
+        }
         const page = this.pages.get(subId);
         if (page) {
           page.events.push(event);
@@ -435,7 +549,10 @@ export class WolfeSubscriber implements IWolfeSubscriber {
       if (this.stopped) return [];
       const ws = await this.ensureOpen();
       try {
-        return await this.reqOnce(ws, subId, filter);
+        const events = await this.reqOnce(ws, subId, filter);
+        // A completed page is a useful connection: reset the backoff ladder.
+        this.attempt = 0;
+        return events;
       } catch (err) {
         if (this.stopped) return [];
         if (tries >= this.pageRetries) throw err;
@@ -510,9 +627,39 @@ export class WolfeSubscriber implements IWolfeSubscriber {
   }
 }
 
+/**
+ * Structural admission check for an untrusted relay frame. Signature
+ * verification stays in MirrorEngine (§5 step 1); this only guarantees the
+ * object is shaped like a Nostr event so no downstream code can throw on it.
+ */
+export function asNostrEvent(value: unknown): NostrEvent | null {
+  if (typeof value !== "object" || value === null) return null;
+  const e = value as Record<string, unknown>;
+  if (typeof e["id"] !== "string" || !/^[0-9a-f]{64}$/i.test(e["id"])) {
+    return null;
+  }
+  if (typeof e["pubkey"] !== "string" || !/^[0-9a-f]{64}$/i.test(e["pubkey"])) {
+    return null;
+  }
+  if (typeof e["sig"] !== "string") return null;
+  if (typeof e["content"] !== "string") return null;
+  if (!Number.isFinite(e["created_at"] as number)) return null;
+  if (typeof e["created_at"] !== "number") return null;
+  if (typeof e["kind"] !== "number") return null;
+  const tags = e["tags"];
+  if (!Array.isArray(tags)) return null;
+  for (const tag of tags) {
+    if (!Array.isArray(tag)) return null;
+    for (const part of tag) if (typeof part !== "string") return null;
+  }
+  return value as NostrEvent;
+}
+
 /** `38400:<pubkey>:<d>` — distinct-address accounting for the hydration cap. */
 function addressOfEvent(event: NostrEvent): string | null {
-  const d = event.tags.find((t) => t[0] === "d")?.[1];
+  const d = Array.isArray(event.tags)
+    ? event.tags.find((t) => Array.isArray(t) && t[0] === "d")?.[1]
+    : undefined;
   if (d === undefined || d.length === 0) return null;
   return `${LISTING_KIND}:${event.pubkey}:${d}`;
 }

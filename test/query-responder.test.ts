@@ -74,7 +74,12 @@ class FakeCache implements IListingCache {
 
 class FakeBuzz implements IBuzzClient {
   published: NostrEvent[] = [];
-  subs: { id: string; filters: NostrFilter[]; onEvent: EventHandler }[] = [];
+  subs: {
+    id: string;
+    filters: NostrFilter[];
+    onEvent: EventHandler;
+    since?: () => number;
+  }[] = [];
   ok: OkResult | null = null;
 
   async connect(): Promise<void> {}
@@ -87,8 +92,14 @@ class FakeBuzz implements IBuzzClient {
     filters: NostrFilter[],
     onEvent: EventHandler,
     _onEose?: EoseHandler,
+    since?: () => number,
   ): Subscription {
-    this.subs.push({ id: subId, filters, onEvent });
+    this.subs.push({
+      id: subId,
+      filters,
+      onEvent,
+      ...(since ? { since } : {}),
+    });
     return { id: subId, close() {} };
   }
   async query(): Promise<NostrEvent[]> {
@@ -406,6 +417,38 @@ describe("find scoring (§6)", () => {
     );
   });
 
+  it("sanitizes the address too, so a reply can never end on a forged footer", () => {
+    // Defense in depth: MirrorEngine normalizes `d` before it becomes part of
+    // the address, but a raw address rendered here would let a newline inside
+    // `d` append an attacker-chosen line signed by the bridge's own pubkey,
+    // which §7 footer recovery would then accept (Security §2).
+    const line = formatResultLine({
+      address: `38400:${"a".repeat(64)}:bait\nnw:38400:${"b".repeat(64)}:victim`,
+      d: `🐺 New service: bait\nnw:38400:${"b".repeat(64)}:victim`,
+      categories: ["ai"],
+      price: "1 sats",
+      score: 3,
+    });
+
+    expect(line.split("\n")).toHaveLength(1);
+    expect(line).not.toContain(`\nnw:38400:${"b".repeat(64)}:victim`);
+  });
+
+  it("cuts the bridge command grammar out of inline fields", () => {
+    // A `find` reply must not re-emit a syntactically valid bridge command
+    // into a channel read by LLM-driven buzz-agents (Security §2).
+    expect(sanitizeInline('svc @bridge publish {"kind":38400}')).toBe("svc");
+    expect(
+      formatResultLine({
+        address: `38400:${"a".repeat(64)}:svc`,
+        d: "svc @bridge help",
+        categories: ["ops @bridge find x"],
+        price: "1 sats",
+        score: 1,
+      }).toLowerCase(),
+    ).not.toContain("@bridge");
+  });
+
   it("replies with the exact no-match message including the cached count", async () => {
     const { qr, buzz, cache } = ctx;
     for (let i = 0; i < 3; i++) {
@@ -443,6 +486,97 @@ describe("replies (§6)", () => {
     expect(lines[0]!.startsWith("🐺 New service:")).toBe(false);
   });
 });
+
+// --- reconnect replay ------------------------------------------------------
+
+describe("reconnect replay guard", () => {
+  it("answers a given mention id exactly once", async () => {
+    // Every reconnect re-issues the mentions REQ with `since = cursor − 300`
+    // (§2), so the relay legitimately replays recent kind:9s. Without an
+    // id-level guard each socket flap posts a second identical reply.
+    const { qr, buzz, advance } = setup();
+    const m = mention({ id: "m-replay", content: "@bridge help" });
+
+    await qr.handleMention(m);
+    advance(30_000); // well past the 5s per-sender cooldown
+    await qr.handleMention(m);
+
+    expect(buzz.published).toHaveLength(1);
+  });
+
+  it("still answers a genuinely new mention from the same sender", async () => {
+    const { qr, buzz, advance } = setup();
+    await qr.handleMention(mention({ id: "m1", content: "@bridge help" }));
+    advance(30_000);
+    await qr.handleMention(mention({ id: "m2", content: "@bridge help" }));
+    expect(buzz.published).toHaveLength(2);
+  });
+
+  it("does not re-answer a mention that was dropped on cooldown", async () => {
+    const { qr, buzz, advance } = setup();
+    await qr.handleMention(mention({ id: "m1", content: "@bridge help" }));
+    const dropped = mention({ id: "m2", content: "@bridge help" });
+    await qr.handleMention(dropped); // inside the cooldown → no reply
+    expect(buzz.published).toHaveLength(1);
+
+    advance(30_000);
+    await qr.handleMention(dropped); // replayed after the cooldown expired
+    expect(buzz.published).toHaveLength(1);
+  });
+});
+
+// --- bounded per-process state ---------------------------------------------
+
+describe("bounded per-process state", () => {
+  it("prunes cooldown entries that can no longer gate anything", async () => {
+    const { qr, advance } = setup();
+    for (let i = 0; i < 50; i++) {
+      await qr.handleMention(
+        mention({
+          id: `m-${i}`,
+          pubkey: i.toString(16).padStart(64, "0"),
+          content: "@bridge help",
+        }),
+      );
+    }
+    const inner = qr as unknown as { cooldowns: Map<string, number> };
+    expect(inner.cooldowns.size).toBe(50);
+
+    advance(COOLDOWN_WINDOW_MS + 1);
+    await qr.handleMention(
+      mention({
+        id: "m-last",
+        pubkey: "f".repeat(64),
+        content: "@bridge help",
+      }),
+    );
+    // Everything older than the 5s window is gone; only the new sender remains.
+    expect(inner.cooldowns.size).toBe(1);
+  });
+
+  it("bounds the helped-thread set instead of growing forever", async () => {
+    const { qr, advance } = setup();
+    const inner = qr as unknown as { helpedThreads: { size: number } };
+    for (let i = 0; i < 1_200; i++) {
+      await qr.handleMention(
+        mention({
+          id: `t-${i}`,
+          pubkey: (i % 7).toString(16).padStart(64, "0"),
+          tags: [
+            ["h", CHANNEL_ID],
+            ["e", `root-${i}`, "", "root"],
+          ],
+          content: "@bridge do a barrel roll",
+        }),
+      );
+      advance(6_000);
+    }
+    expect(inner.helpedThreads.size).toBeLessThanOrEqual(1_000);
+  });
+});
+
+/** Mirrors COOLDOWN_MS in src/query-responder.ts (§6). */
+const COOLDOWN_WINDOW_MS = 5_000;
 
 // --- cooldown --------------------------------------------------------------
 
@@ -569,7 +703,14 @@ describe("mentions subscription since (§6, flow #7)", () => {
     const filter = buzz.subs[0]!.filters[0]!;
     expect(filter.kinds).toEqual([9]);
     expect(filter["#h"]).toEqual([CHANNEL_ID]);
-    expect(filter.since).toBe(NOW_SEC - 300);
+    // `since` is NOT baked into the filter: it is supplied as a cursor callback
+    // so BuzzClient recomputes `cursor − 300` on every resubscribe after a
+    // reconnect (§2). A static `since` replays an ever-growing window.
+    expect(filter.since).toBeUndefined();
+    const since = buzz.subs[0]!.since;
+    expect(since).toBeTypeOf("function");
+    // BuzzClient subtracts the 300s skew itself.
+    expect(since!() - 300).toBe(NOW_SEC - 300);
   });
 
   it("routes subscription events into handleMention", async () => {

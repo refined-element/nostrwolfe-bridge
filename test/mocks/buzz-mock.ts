@@ -96,6 +96,12 @@ export interface BuzzMockOptions {
    * Accepted kind:9 / kind:0 events are stored and pushed to matching live subs.
    */
   channelAware?: boolean;
+  /**
+   * Never send the proactive `["AUTH", <challenge>]` — models a plain relay, a
+   * TLS-terminating proxy, or a dropped challenge frame. The socket is open and
+   * healthy but the handshake never starts (spec §2).
+   */
+  withholdAuthChallenge?: boolean;
 }
 
 export interface MockConnection {
@@ -130,6 +136,7 @@ export class BuzzMockRelay {
   private okScript: ScriptedOk[] = [];
   private authScript: ScriptedOk[] = [];
   private closedScript = new Map<string, string>();
+  private readonly persistentClosed = new Set<string>();
   private eventResponder:
     ((event: NostrEvent, ctx: EventContext) => ScriptedOk | undefined) | null =
     null;
@@ -193,9 +200,13 @@ export class BuzzMockRelay {
     return this;
   }
 
-  /** Respond to the REQ with sub id `subId` with `["CLOSED", subId, message]`. */
-  scriptClosed(subId: string, message: string): this {
+  /**
+   * Respond to the REQ with sub id `subId` with `["CLOSED", subId, message]`.
+   * One-shot by default; `persistent` closes every re-issue of the same sub.
+   */
+  scriptClosed(subId: string, message: string, persistent = false): this {
     this.closedScript.set(subId, message);
+    if (persistent) this.persistentClosed.add(subId);
     return this;
   }
 
@@ -320,7 +331,9 @@ export class BuzzMockRelay {
       this.onFrame(conn, data.toString());
     });
     // Proactive AUTH: the relay speaks first (connection.rs:157).
-    this.send(conn, ["AUTH", challenge]);
+    if (this.options.withholdAuthChallenge !== true) {
+      this.send(conn, ["AUTH", challenge]);
+    }
   }
 
   private send(conn: MockConnection, payload: unknown): void {
@@ -518,7 +531,7 @@ export class BuzzMockRelay {
     }
     const scripted = this.closedScript.get(subId);
     if (scripted !== undefined) {
-      this.closedScript.delete(subId);
+      if (!this.persistentClosed.has(subId)) this.closedScript.delete(subId);
       this.send(conn, ["CLOSED", subId, scripted]);
       return;
     }

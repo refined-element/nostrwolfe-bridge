@@ -81,13 +81,25 @@ function log(
  */
 const CONTROL_CHARS =
   // eslint-disable-next-line no-control-regex
-  /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
+  /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u00AD\u180E\u200B-\u200F\u2028\u2029\u202A-\u202E\u2066-\u2069\uFEFF]/g;
 
 /** The bridge's own command grammar; a listing must never be re-interpretable. */
 const BRIDGE_COMMAND = /@bridge\b/i;
 
 /** A provider line forging the machine-readable footer grammar. */
 const FOOTER_LINE = /^nw:/i;
+
+/**
+ * Per-field render caps. `content` has its own {@link CONTENT_MAX}; every
+ * *tag*-derived field is capped here too, so a 64 KB tag value can never push a
+ * card past the 65,536-byte Buzz WS frame cap (§2 frame budget).
+ */
+export const FIELD_MAX = {
+  /** `d` — also the address/footer key, so the cap is generous but finite. */
+  d: 200,
+  url: 512,
+  short: 64,
+} as const;
 
 /** Strip control chars; collapse tabs to spaces. Keeps newlines. */
 function stripControl(raw: string): string {
@@ -97,11 +109,27 @@ function stripControl(raw: string): string {
 /**
  * Sanitize a value rendered into a single card field: no control chars, no
  * newlines (a newline in a tag value could otherwise forge a card line or
- * footer), trimmed.
+ * footer), no bridge command grammar, whitespace-collapsed, trimmed, and capped.
+ *
+ * Security §2 requires "anything matching the bridge's own command grammar" to
+ * be stripped from the whole card, not just from `content` — tags come from the
+ * same unauthenticated relay and land in the same LLM-read channel, so the
+ * `@bridge` cut lives here rather than only in {@link sanitizeContent}.
+ *
+ * Idempotent: sanitizing an already-sanitized value (including a truncated one)
+ * returns it unchanged, which is what lets the address, header and footer be
+ * derived from the same string by construction (§7).
  */
-export function sanitizeField(raw: string | undefined): string {
+export function sanitizeField(
+  raw: string | undefined,
+  max: number = FIELD_MAX.url,
+): string {
   if (raw === undefined) return "";
-  return stripControl(raw).replace(/\n+/g, " ").replace(/\s+/g, " ").trim();
+  let s = stripControl(raw);
+  const cmd = s.search(BRIDGE_COMMAND);
+  if (cmd >= 0) s = s.slice(0, cmd);
+  s = s.replace(/\n+/g, " ").replace(/\s+/g, " ").trim();
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
 /**
@@ -152,10 +180,18 @@ function parseNegotiable(tag: NostrTag | undefined): Negotiable | undefined {
   return undefined;
 }
 
-/** Addressable form `38400:<pubkey>:<d>` (NIP-33, spec §5 step 2). */
+/**
+ * Addressable form `38400:<pubkey>:<d>` (NIP-33, spec §5 step 2).
+ *
+ * The `d` part is the **sanitized** tag value, because the same string is the
+ * dedupe key, the card header and the card footer — deriving all three from one
+ * normalization is what makes footer recovery able to re-derive the dedupe set
+ * (§7). A raw `d` would also let a newline inside the tag forge extra card
+ * lines wherever the address is rendered (Security §2).
+ */
 export function addressOf(event: NostrEvent): string | null {
-  const d = firstTag(event.tags, "d")?.[1];
-  if (d === undefined || d.length === 0) return null;
+  const d = sanitizeField(firstTag(event.tags, "d")?.[1], FIELD_MAX.d);
+  if (d.length === 0) return null;
   return `${LISTING_KIND}:${event.pubkey}:${d}`;
 }
 
@@ -182,8 +218,11 @@ export function parseListing(event: NostrEvent): ParsedListing | null {
   };
   if (!verifyEvent(plain as never)) return null;
 
-  const d = firstTag(event.tags, "d")?.[1];
-  if (d === undefined || d.length === 0) return null;
+  // Normalize once, here: `listing.d`, `listing.address`, the card header and
+  // the card footer are all this one string, so the footer a recovery scan
+  // reads is always exactly the key the live path looks up (§7).
+  const d = sanitizeField(firstTag(event.tags, "d")?.[1], FIELD_MAX.d);
+  if (d.length === 0) return null;
 
   const s = tagValues(event.tags, "s")
     .map((t) => (t[1] ?? "").trim())
@@ -243,7 +282,13 @@ export function parseListing(event: NostrEvent): ParsedListing | null {
   const uptime = firstTag(event.tags, "uptime")?.[1];
   if (uptime !== undefined && uptime.length > 0) listing.uptime = uptime;
 
-  const negotiable = parseNegotiable(firstTag(event.tags, "negotiable"));
+  // NIP-ASA: "If the `negotiable` tag is omitted, agents SHOULD assume the
+  // price is negotiable (`true`)" — so an absent tag is materialized as `yes`
+  // here. A *present but unparseable* tag stays undefined and renders as `—`.
+  const negotiableTag = firstTag(event.tags, "negotiable");
+  const negotiable = negotiableTag
+    ? parseNegotiable(negotiableTag)
+    : ({ kind: "yes" } as const);
   if (negotiable) listing.negotiable = negotiable;
 
   return listing;
@@ -261,10 +306,10 @@ function trimNumber(n: number): string {
 export function formatPriceTier(tier: PriceTier): string {
   if (tier.amount.length === 0 || !Number.isFinite(Number(tier.amount)))
     return DASH;
-  const parts = [sanitizeField(tier.amount)];
-  const currency = sanitizeField(tier.currency);
+  const parts = [sanitizeField(tier.amount, FIELD_MAX.short)];
+  const currency = sanitizeField(tier.currency, FIELD_MAX.short);
   if (currency.length > 0) parts.push(currency);
-  const frequency = sanitizeField(tier.frequency);
+  const frequency = sanitizeField(tier.frequency, FIELD_MAX.short);
   if (frequency.length > 0) parts.push(frequency);
   return parts.join(" ");
 }
@@ -277,10 +322,10 @@ export function formatPrices(tiers: PriceTier[]): string {
 
 /** l402 URL, else endpoint URL (+ method), else em-dash. */
 export function formatEndpoint(listing: ParsedListing): string {
-  if (listing.l402) return sanitizeField(listing.l402);
+  if (listing.l402) return sanitizeField(listing.l402, FIELD_MAX.url);
   if (listing.endpoint) {
-    const url = sanitizeField(listing.endpoint.url);
-    const method = sanitizeField(listing.endpoint.method);
+    const url = sanitizeField(listing.endpoint.url, FIELD_MAX.url);
+    const method = sanitizeField(listing.endpoint.method, FIELD_MAX.short);
     return method.length > 0 ? `${url} (${method})` : url;
   }
   return DASH;
@@ -319,7 +364,10 @@ export function formatNegotiable(n: Negotiable | undefined): string {
  * newlines) before it reaches either the header or the footer.
  */
 export function formatCard(listing: ParsedListing, kind: CardKind): string {
-  const d = sanitizeField(listing.d);
+  // `listing.d` is already the canonical sanitized value (parseListing), so the
+  // footer here is byte-identical to `listing.address`'s `d` part by
+  // construction — the invariant footer recovery depends on (§7).
+  const d = sanitizeField(listing.d, FIELD_MAX.d);
   const footer = `nw:${LISTING_KIND}:${listing.pubkey}:${d}`;
   const header = `${HEADERS[kind]}${d}`;
 
@@ -329,16 +377,18 @@ export function formatCard(listing: ParsedListing, kind: CardKind): string {
 
   const categories =
     listing.s
-      .map(sanitizeField)
+      .map((v) => sanitizeField(v, FIELD_MAX.short))
       .filter((v) => v.length > 0)
       .join(", ") || DASH;
   const hashtags =
     listing.t
-      .map((tag) => sanitizeField(tag))
+      .map((tag) => sanitizeField(tag, FIELD_MAX.short))
       .filter((v) => v.length > 0)
       .map((v) => `#${v}`)
       .join(" ") || DASH;
-  const capacity = listing.capacity ? sanitizeField(listing.capacity) : DASH;
+  const capacity = listing.capacity
+    ? sanitizeField(listing.capacity, FIELD_MAX.short)
+    : DASH;
 
   const lines = [
     header,
@@ -426,11 +476,19 @@ export class MirrorEngine implements IMirrorEngine {
       return { type: "skip", reason: "invalid" };
     }
 
-    const { address } = listing;
-    // §4 — cursor is max created_at processed; advanced for every validated
-    // event (including skips) so a run of duplicates still moves it forward.
+    const outcome = await this.decide(listing);
+    // §4 — the cursor is the max `created_at` *terminally* processed. It is
+    // advanced only here, after `decide` returned without throwing: a card
+    // publish that was rejected (CardPublishError) or a channel that is
+    // mid-re-run must not move the cursor past an event the live sub would then
+    // never redeliver (`since = cursor − 300`).
     this.advanceCursor(listing.createdAt);
+    return outcome;
+  }
 
+  /** The §5 decision table proper. Throws if the card publish is rejected. */
+  private async decide(listing: ParsedListing): Promise<MirrorOutcome> {
+    const { address } = listing;
     const matches = this.categoriesMatch(listing.s);
     const entry = this.state.getState().mirrored[address];
 
@@ -468,7 +526,8 @@ export class MirrorEngine implements IMirrorEngine {
     } else if (listing.createdAt === entry.createdAt) {
       // §5 step 3 — NIP-33 same-second tie-break: lowest id wins. An
       // unconditional `≤ → skip` would drop legitimate replacements.
-      replaces = event.id !== entry.eventId && event.id < entry.eventId;
+      replaces =
+        listing.event.id !== entry.eventId && listing.event.id < entry.eventId;
       if (!replaces) {
         return { type: "skip", reason: "duplicate", address };
       }

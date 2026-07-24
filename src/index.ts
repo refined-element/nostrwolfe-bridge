@@ -16,6 +16,7 @@ import { finalizeEvent } from "nostr-tools/pure";
 import {
   BuzzClient,
   BuzzFatalError,
+  FrameTooLargeError,
   type BuzzClientHooks,
   type Logger,
 } from "./buzz-client.js";
@@ -43,8 +44,11 @@ import type {
 // Kinds (the bridge only ever writes kinds the Buzz relay already accepts)
 // ---------------------------------------------------------------------------
 
-const KIND_CHANNEL_MESSAGE = 9;
 const KIND_JOIN_REQUEST = 9021;
+
+/** Backoff for retrying a failed ChannelManager re-run (§3, error matrix). */
+const CHANNEL_RERUN_BASE_DELAY_MS = 1_000;
+const CHANNEL_RERUN_MAX_DELAY_MS = 60_000;
 
 // ---------------------------------------------------------------------------
 // Logging — plain stdout JSON lines, pino-style levels (spec §1 `LOG_LEVEL`)
@@ -175,6 +179,8 @@ export async function startBridge(
   let mentionsChannelId: string | null = null;
   /** Serializes ChannelManager re-runs triggered from hooks. */
   let rerun: Promise<void> = Promise.resolve();
+  /** Pending re-run retries, cleared on stop() so tests/daemons exit cleanly. */
+  const channelRerunTimers = new Set<NodeJS.Timeout>();
 
   const channelId = (): string => {
     const id = state.getState().channelId;
@@ -195,30 +201,23 @@ export async function startBridge(
     if (mentionsSub !== null && mentionsChannelId === id) return;
     mentionsSub?.close();
     mentionsChannelId = id;
-    mentionsSub = buzz.subscribe(
-      `ch-${id}`,
-      [{ kinds: [KIND_CHANNEL_MESSAGE], "#h": [id] }],
-      (event) => {
-        void responder.handleMention(event).catch((err: unknown) => {
-          log.error("mention handling failed", {
-            id: event.id,
-            error: String(err),
-          });
-        });
-      },
-      undefined,
-      () => {
-        const cursor = state.getState().cursors.buzz;
-        return cursor > 0 ? cursor : Math.floor(Date.now() / 1000);
-      },
-    );
+    // Delegate to QueryResponder.start() so the shipped path is the tested one.
+    mentionsSub = responder.start();
     log.info("mentions subscription open", { channelId: id });
   };
 
-  /** Serialized ChannelManager re-run + mentions resubscribe. */
+  /**
+   * Serialized ChannelManager re-run + mentions resubscribe.
+   *
+   * A failed re-run leaves `channelId` null, which wedges every publish and
+   * every reply (`channelId()` throws), so the failure MUST be retried rather
+   * than logged and dropped: the only other escape is a WS reconnect that a
+   * healthy socket may never produce (§3, error matrix).
+   */
   const scheduleChannelRerun = (
     reason: string,
     run: () => Promise<string>,
+    attempt = 0,
   ): void => {
     rerun = rerun.then(async () => {
       if (stopped) return;
@@ -227,10 +226,24 @@ export async function startBridge(
         log.info("ChannelManager re-run complete", { reason, channelId: id });
         ensureMentionsSubscription();
       } catch (err) {
-        log.error("ChannelManager re-run failed", {
+        const delay =
+          Math.min(
+            CHANNEL_RERUN_MAX_DELAY_MS,
+            CHANNEL_RERUN_BASE_DELAY_MS * 2 ** attempt,
+          ) * (options.timeScale ?? 1);
+        log.error("ChannelManager re-run failed; retrying", {
           reason,
+          attempt: attempt + 1,
+          delayMs: Math.round(delay),
           error: String(err),
         });
+        const timer: NodeJS.Timeout = setTimeout(() => {
+          channelRerunTimers.delete(timer);
+          scheduleChannelRerun(reason, run, attempt + 1);
+        }, delay);
+        // A pending retry must not hold an otherwise-idle process open.
+        if (typeof timer.unref === "function") timer.unref();
+        channelRerunTimers.add(timer);
       }
     });
   };
@@ -344,6 +357,17 @@ export async function startBridge(
         });
         return;
       }
+      if (err instanceof FrameTooLargeError) {
+        // Not transient and not retryable: the listing's tags render to a card
+        // bigger than the 65,536-byte frame cap, so it can never be mirrored.
+        // Name it explicitly instead of hiding it in a generic failure log.
+        log.error("listing renders to an oversized card; never mirrorable", {
+          id: event.id,
+          pubkey: event.pubkey,
+          bytes: err.bytes,
+        });
+        return;
+      }
       log.error("listing handling failed", {
         id: event.id,
         error: String(err),
@@ -384,7 +408,14 @@ export async function startBridge(
   const wolfe = new WolfeSubscriber(
     config,
     () => state.getState().cursors.wolfe,
-    options.wolfe ?? {},
+    {
+      // §1: `MIRROR_MAX_LISTINGS` caps addresses *tracked*, so hydration measures
+      // the mirror's own cache rather than every address the relay hands it —
+      // otherwise a narrow `MIRROR_CATEGORIES` spends the cap on listings the
+      // client-side filter immediately discards.
+      trackedCount: () => cache.size,
+      ...(options.wolfe ?? {}),
+    },
   );
   await wolfe.hydrate(onListing);
 
@@ -412,6 +443,8 @@ export async function startBridge(
     stop: async (): Promise<void> => {
       if (stopped) return;
       stopped = true;
+      for (const timer of channelRerunTimers) clearTimeout(timer);
+      channelRerunTimers.clear();
       mentionsSub?.close();
       mentionsSub = null;
       wolfe.close();

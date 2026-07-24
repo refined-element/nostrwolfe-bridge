@@ -132,12 +132,21 @@ export async function recoverMirroredFromChannel(
       mirrored[footer.address] = entry;
     }
 
-    // Drained: a short page means the relay had nothing more to give.
-    if (events.length < FOOTER_RECOVERY_PAGE_SIZE) break;
-    // No progress (e.g. a whole page sharing one `created_at`): stop rather
-    // than re-request the same window forever. `until` is inclusive, so the
-    // event-id dedupe above is what makes an overlapping page harmless.
-    if (fresh === 0) break;
+    // Page-shortness is NOT a drain signal — a relay may cap any page below the
+    // requested limit, and treating a short first page as "drained" silently
+    // truncates the rebuilt dedupe set, which is exactly the duplicate-card
+    // storm §7 exists to bound. Only an empty page, or a full page that yielded
+    // no new ids, ends the walk (`until` is inclusive, so the id dedupe above
+    // makes an overlapping page harmless).
+    if (fresh === 0) {
+      if (events.length < FOOTER_RECOVERY_PAGE_SIZE) break;
+      // A whole page sharing one `created_at`: step strictly below the window
+      // we just asked for rather than re-requesting it forever. `Math.min` with
+      // the previous `until` keeps the walk monotonic even if the relay ignores
+      // it and keeps replaying the same newest-first set.
+      until = Math.min(oldest, until ?? oldest) - 1;
+      continue;
+    }
 
     until = oldest;
   }

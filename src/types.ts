@@ -305,6 +305,13 @@ export interface IBuzzClient {
     filters: NostrFilter[],
     onEvent: EventHandler,
     onEose?: EoseHandler,
+    /**
+     * Cursor source. When given, every (re)issue of the REQ carries
+     * `since = cursor − 300`, which is what makes a resubscribe after reconnect
+     * pick up where the last one left off instead of replaying a static window
+     * (spec §2). Callers that bake `since` into `filters` get a fixed window.
+     */
+    since?: () => number,
   ): Subscription;
   /**
    * One-shot historical REQ: collect events until EOSE, then CLOSE and resolve.

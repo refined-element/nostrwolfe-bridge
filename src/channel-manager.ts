@@ -181,6 +181,17 @@ function tagValue(event: NostrEvent, name: string): string | undefined {
 
 // --- ChannelManager --------------------------------------------------------
 
+/**
+ * The channel disappeared mid-run (`invalid: channel not found` on the join).
+ * Internal to {@link ChannelManager.runEnsure}, which re-runs discovery once.
+ */
+class ChannelVanished extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChannelVanished";
+  }
+}
+
 /** Duck-typed event source — BuzzClient exposes `on()` if it emits triggers. */
 interface TriggerSource {
   on(event: string, listener: (...args: unknown[]) => void): unknown;
@@ -228,6 +239,23 @@ export class ChannelManager implements IChannelManager {
   }
 
   private async runEnsure(): Promise<string> {
+    // `invalid: channel not found` during the join means the channel vanished
+    // between discovery and join. The error matrix says clear `channelId` and
+    // **re-run** ChannelManager — but re-entering ensureChannel() here would
+    // await the very promise we are inside, so the re-run is this loop.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.runEnsureOnce();
+      } catch (err) {
+        if (attempt >= 1 || !(err instanceof ChannelVanished)) throw err;
+        this.log("warn", "channel vanished during join; re-running discovery", {
+          message: err.message,
+        });
+      }
+    }
+  }
+
+  private async runEnsureOnce(): Promise<string> {
     const persisted = this.state.getState().channelId;
     const deterministic = this.deterministicChannelId();
 
@@ -341,7 +369,10 @@ export class ChannelManager implements IChannelManager {
         this.log("error", "channelLost re-run failed", { err: String(err) });
       });
     });
-    source.on("reconnected", () => {
+    // BuzzClient emits `authenticated` after **every** AUTH — initial connect
+    // and every reconnect. There is no `reconnected` event; listening for one
+    // silently disabled the reconnect-side 39000 verification (§3).
+    source.on("authenticated", () => {
       void this.handleReconnect().catch((err: unknown) => {
         this.log("error", "reconnect verification failed", {
           err: String(err),
@@ -410,6 +441,7 @@ export class ChannelManager implements IChannelManager {
       this.state.mutate((s) => {
         s.channelId = null;
       });
+      throw new ChannelVanished(`channel join rejected: ${ok.message}`);
     }
     throw new Error(`channel join rejected: ${ok.message}`);
   }

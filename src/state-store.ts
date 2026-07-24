@@ -38,6 +38,20 @@ export function emptyState(community: string): BridgeState {
   };
 }
 
+let tmpSeq = 0;
+
+/**
+ * Unique scratch path per write. A single shared `<path>.tmp` lets a
+ * signal-handler {@link atomicWriteSync} truncate and rename the file an
+ * in-flight {@link atomicWrite} still holds an fd to — the async writer then
+ * finishes writing into the *live* state file. Unique names make the two
+ * writers independent; the rename remains the atomic commit point.
+ */
+function tmpPath(path: string): string {
+  tmpSeq += 1;
+  return `${path}.${String(process.pid)}.${String(tmpSeq)}.tmp`;
+}
+
 /** Hooks used by tests to interrupt an atomic write mid-flight. */
 export interface AtomicWriteHooks {
   /** Invoked after the tmp file is fsynced but **before** the rename. */
@@ -57,7 +71,7 @@ export async function atomicWrite(
   data: string,
   hooks: AtomicWriteHooks = {},
 ): Promise<void> {
-  const tmp = `${path}.tmp`;
+  const tmp = tmpPath(path);
   await mkdir(dirname(path), { recursive: true });
 
   const handle = await open(tmp, "w");
@@ -75,7 +89,7 @@ export async function atomicWrite(
 
 /** Synchronous twin of {@link atomicWrite}, for signal handlers (spec §7). */
 export function atomicWriteSync(path: string, data: string): void {
-  const tmp = `${path}.tmp`;
+  const tmp = tmpPath(path);
   mkdirSync(dirname(path), { recursive: true });
 
   const fd = openSync(tmp, "w");
@@ -278,8 +292,15 @@ export class StateStore implements IStateStore {
    */
   flushSync(): void {
     this.cancelTimer();
+    const payload = this.serialize();
     this.dirty = false;
-    atomicWriteSync(this.stateFile, this.serialize());
+    try {
+      atomicWriteSync(this.stateFile, payload);
+    } catch (err) {
+      // Leave the document dirty so a caller that survives can retry.
+      this.markDirty();
+      throw err;
+    }
     this.writes++;
   }
 
@@ -349,13 +370,36 @@ export class StateStore implements IStateStore {
     }
   }
 
+  /**
+   * Chain one atomic write.
+   *
+   * The task must never settle rejected: a rejected `chain` would make every
+   * subsequent `.then(...)` callback unreachable, silently freezing state on
+   * disk forever, and the debounce timer's `void enqueueWrite()` would raise an
+   * unhandled rejection (fatal under Node's default `--unhandled-rejections=
+   * throw`, bypassing the SIGTERM flush entirely). So the error is caught here,
+   * reported, and the document is left dirty with the debounce re-armed so the
+   * write is retried.
+   */
   private enqueueWrite(): Promise<void> {
     // Snapshot at enqueue time is wrong (later mutations must win), so the
     // serialization happens inside the chained task instead.
     this.chain = this.chain.then(async () => {
+      // Serialize first, then clear `dirty`, so a mutation arriving *during*
+      // the await still marks the document dirty for the next flush.
+      const payload = this.serialize();
       this.dirty = false;
-      await atomicWrite(this.stateFile, this.serialize());
-      this.writes++;
+      try {
+        await atomicWrite(this.stateFile, payload);
+        this.writes++;
+      } catch (err) {
+        this.onWarn({
+          event: "corrupt-state",
+          message: `state write failed: ${String(err)}`,
+          stateFile: this.stateFile,
+        });
+        this.markDirty();
+      }
     });
     return this.chain;
   }

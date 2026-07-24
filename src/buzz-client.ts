@@ -51,6 +51,17 @@ const CONCURRENT_RETRY_MS = 1_000;
 const DEFAULT_OK_TIMEOUT_MS = 30_000;
 const DEFAULT_QUERY_TIMEOUT_MS = 20_000;
 
+/**
+ * How long to wait for the relay's proactive `["AUTH", <challenge>]` after the
+ * socket opens (spec §2). Without this a plain relay, a TLS-terminating proxy
+ * or a dropped challenge leaves `connect()` pending forever — the whole startup
+ * sequence hangs behind it and no supervisor sees a failure.
+ */
+const DEFAULT_AUTH_CHALLENGE_TIMEOUT_MS = 15_000;
+
+/** Re-issues of a persistent REQ closed with a non-retryable message. */
+const CLOSED_RESUB_MAX = 3;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -233,6 +244,8 @@ export interface BuzzClientOptions {
   okTimeoutMs?: number;
   /** How long a one-shot {@link BuzzClient.query} waits for EOSE. */
   queryTimeoutMs?: number;
+  /** How long to wait for the relay's proactive AUTH challenge after connect. */
+  authChallengeTimeoutMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +277,8 @@ interface SubRecord {
   since?: () => number;
   active: boolean;
   closed: boolean;
+  /** Re-issues after a non-retryable CLOSED; reset on every fresh AUTH. */
+  closedResubs: number;
 }
 
 interface QueryRecord {
@@ -329,10 +344,13 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
   private readonly timeScale: number;
   private readonly okTimeoutMs: number;
   private readonly queryTimeoutMs: number;
+  private readonly authChallengeTimeoutMs: number;
   private readonly bucket: TokenBucket;
 
   private ws: WebSocket | null = null;
   private status: Status = "idle";
+  /** Armed on socket open, cleared by the inbound AUTH frame (spec §2). */
+  private authChallengeTimer: NodeJS.Timeout | null = null;
 
   /** Challenge for the *current* connection; issued once per connection (spec §2). */
   private challenge: string | null = null;
@@ -378,6 +396,8 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
     this.timeScale = options.timeScale ?? 1;
     this.okTimeoutMs = options.okTimeoutMs ?? DEFAULT_OK_TIMEOUT_MS;
     this.queryTimeoutMs = options.queryTimeoutMs ?? DEFAULT_QUERY_TIMEOUT_MS;
+    this.authChallengeTimeoutMs =
+      options.authChallengeTimeoutMs ?? DEFAULT_AUTH_CHALLENGE_TIMEOUT_MS;
     this.bucket = new TokenBucket(config.buzzMsgsPerMin, BURST_PER_SECOND);
   }
 
@@ -480,6 +500,7 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
       ...(since ? { since } : {}),
       active: false,
       closed: false,
+      closedResubs: 0,
     };
     this.subs.set(subId, record);
     if (this.status === "ready") this.sendReq(record);
@@ -553,6 +574,20 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
       this.log.debug("buzz socket open; awaiting proactive AUTH challenge", {
         url,
       });
+      // §2: the relay sends the challenge unprompted. If it never arrives the
+      // socket is healthy but useless, and connect() would hang forever.
+      this.clearAuthChallengeTimer();
+      const timer = setTimeout(() => {
+        this.authChallengeTimer = null;
+        if (this.ws !== ws || this.status === "ready") return;
+        this.log.error("no AUTH challenge from buzz relay; reconnecting", {
+          url,
+          timeoutMs: this.authChallengeTimeoutMs,
+        });
+        this.dropConnection("no AUTH challenge");
+      }, this.authChallengeTimeoutMs * this.timeScale);
+      if (typeof timer.unref === "function") timer.unref();
+      this.authChallengeTimer = timer;
     });
     ws.on("message", (data: WebSocket.RawData) => {
       if (this.ws !== ws) return;
@@ -571,6 +606,7 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
   private onSocketClosed(code: number): void {
     const wasReady = this.status === "ready";
     if (this.status !== "closed") this.status = "connecting";
+    this.clearAuthChallengeTimer();
     this.challenge = null;
     this.authInFlight = false;
     for (const sub of this.subs.values()) sub.active = false;
@@ -591,6 +627,19 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
       } else {
         record.retried = true;
         record.events = [];
+        // `sent` stays true so completeAuth re-issues the REQ on the new
+        // connection (startQuery has already returned for this record).
+        // Re-arm the EOSE deadline: reconnect backoff routinely exceeds the
+        // query timeout, so leaving the original timer running would reject a
+        // query that is deliberately being retried — taking startup (channel
+        // discovery) down with it on a transient relay bounce (§2).
+        clearTimeout(record.timer);
+        record.timer = setTimeout(() => {
+          this.queries.delete(record.id);
+          record.reject(
+            new Error(`query ${record.id} timed out waiting for EOSE`),
+          );
+        }, this.queryTimeoutMs);
       }
     }
 
@@ -621,12 +670,23 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
     }, delay);
   }
 
+  private clearAuthChallengeTimer(): void {
+    if (this.authChallengeTimer === null) return;
+    clearTimeout(this.authChallengeTimer);
+    this.authChallengeTimer = null;
+  }
+
   private closeSocket(): void {
+    this.clearAuthChallengeTimer();
     const ws = this.ws;
     this.ws = null;
     if (!ws) return;
     try {
       ws.removeAllListeners();
+      // A socket torn down mid-handshake still emits `error` asynchronously,
+      // and `ws` rethrows an `error` event with no listener — which would take
+      // the whole daemon down from inside a routine reconnect.
+      ws.on("error", () => undefined);
       ws.close();
       ws.terminate();
     } catch {
@@ -665,6 +725,7 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
       case "AUTH": {
         const challenge = arr[1];
         if (typeof challenge !== "string") return;
+        this.clearAuthChallengeTimer();
         this.challenge = challenge;
         this.log.debug("received proactive AUTH challenge");
         void this.runAuth();
@@ -864,6 +925,7 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
     this.emit("authenticated");
 
     for (const sub of this.subs.values()) {
+      sub.closedResubs = 0;
       if (!sub.closed) this.sendReq(sub);
     }
     for (const record of this.queries.values()) {
@@ -1006,7 +1068,32 @@ export class BuzzClient extends EventEmitter implements IBuzzClient {
         clearTimeout(query.timer);
         this.queries.delete(subId);
         query.reject(new Error(`REQ ${subId} closed: ${message}`));
+        return;
       }
+      // A persistent sub closed with an unrecognized message must NOT be
+      // abandoned: the record stays in `subs` marked active, so nothing would
+      // ever re-issue it and the bridge would silently stop seeing mentions on
+      // an otherwise healthy connection. Re-issue a bounded number of times,
+      // then drop the connection so the reconnect path restores every sub.
+      if (!sub || sub.closed) return;
+      sub.active = false;
+      sub.closedResubs += 1;
+      if (sub.closedResubs > CLOSED_RESUB_MAX) {
+        this.log.error("subscription closed repeatedly; dropping connection", {
+          subId,
+          message,
+          attempts: sub.closedResubs,
+        });
+        this.dropConnection(`subscription ${subId} closed: ${message}`);
+        return;
+      }
+      this.log.error("subscription closed with a non-retryable message", {
+        subId,
+        message,
+        attempt: sub.closedResubs,
+      });
+      await this.delay(CONCURRENT_RETRY_MS * 2 ** (sub.closedResubs - 1));
+      if (this.status === "ready" && !sub.closed) this.sendReq(sub);
       return;
     }
 

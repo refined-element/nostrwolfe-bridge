@@ -190,8 +190,10 @@ describe("recoverMirroredFromChannel", () => {
     });
     expect(mirrored[`38400:${hex(9001)}:old-svc`]?.cardMsgId).toBe("p2-0");
 
-    // First page: no `until`; second page: `until` = oldest of page one.
-    expect(buzz.filters).toHaveLength(2);
+    // First page: no `until`; second page: `until` = oldest of page one; third
+    // page probes below page two — page-shortness is NOT a drain signal (§4/§7),
+    // only an empty page (or a full page with no new ids) ends the walk.
+    expect(buzz.filters).toHaveLength(3);
     expect(buzz.filters[0]).toEqual({
       kinds: [9],
       "#h": [CHANNEL],
@@ -200,8 +202,38 @@ describe("recoverMirroredFromChannel", () => {
     expect(buzz.filters[1]?.until).toBe(
       2_000_000 - (FOOTER_RECOVERY_PAGE_SIZE - 1),
     );
-    // A short page ends the walk.
-    expect(buzz.filters).toHaveLength(2);
+    expect(buzz.filters[2]?.until).toBe(1_000_000);
+  });
+
+  it("does not treat a relay-capped short page as drained", async () => {
+    // The relay caps the first page well below the requested limit. Treating
+    // that as "drained" would truncate the rebuilt dedupe set and re-post a
+    // duplicate "New service" card for every older listing (§7).
+    const buzz = new FakeBuzz([
+      [
+        card({
+          id: "recent",
+          created_at: 900,
+          content: cardBody("🐺 New service:", "recent-svc", hex(20)),
+        }),
+      ],
+      [
+        card({
+          id: "older",
+          created_at: 800,
+          content: cardBody("🐺 New service:", "older-svc", hex(21)),
+        }),
+      ],
+      [],
+    ]);
+
+    const mirrored = await recoverMirroredFromChannel(buzz, CHANNEL, BRIDGE);
+
+    expect(Object.keys(mirrored).sort()).toEqual([
+      `38400:${hex(20)}:recent-svc`,
+      `38400:${hex(21)}:older-svc`,
+    ]);
+    expect(buzz.filters).toHaveLength(3);
   });
 
   it("ignores a spoofed nw: line in the card body and keeps the real footer", async () => {
@@ -363,6 +395,12 @@ describe("recoverMirroredFromChannel", () => {
     const mirrored = await recoverMirroredFromChannel(buzz, CHANNEL, BRIDGE);
 
     expect(Object.keys(mirrored)).toHaveLength(FOOTER_RECOVERY_PAGE_SIZE);
-    expect(buzz.filters).toHaveLength(2);
+    // A full page with no new ids steps `until` strictly below the saturated
+    // second instead of re-requesting the identical window; this fake ignores
+    // `until`, so the walk only ends when it runs out of scripted pages.
+    expect(buzz.filters).toHaveLength(4);
+    expect(buzz.filters[1]?.until).toBe(500);
+    expect(buzz.filters[2]?.until).toBe(499);
+    expect(buzz.filters[3]?.until).toBe(498);
   });
 });

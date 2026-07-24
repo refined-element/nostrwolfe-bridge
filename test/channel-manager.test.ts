@@ -1,4 +1,6 @@
-import { describe, expect, it, beforeEach } from "vitest";
+import { EventEmitter } from "node:events";
+
+import { describe, expect, it, beforeEach, vi } from "vitest";
 import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
 
 import {
@@ -371,6 +373,29 @@ describe("ensureChannel (§3)", () => {
     expect(state.state.channelId).toBeNull();
   });
 
+  it("re-runs discovery when the join reports `invalid: channel not found`", async () => {
+    // The error matrix says this clears `channelId` AND re-runs ChannelManager.
+    // Throwing instead left `channelId` null with nobody to retry, so every
+    // later publish and reply threw "Services channel is not resolved yet".
+    const { cm, buzz, state } = ctx;
+    const ghost = "44444444-0000-5000-8000-000000000000";
+    buzz.metadata = [meta(ghost, "Services", 5)];
+    buzz.okFor = (e) =>
+      e.kind === 9021 && !buzz.published.some((p) => p.kind === 9007)
+        ? { id: e.id, ok: false, message: "invalid: channel not found" }
+        : { id: e.id, ok: true, message: "" };
+    // The channel is gone by the time we re-discover.
+    buzz.publishHooks.push((e) => {
+      if (e.kind === 9021) buzz.metadata = [];
+    });
+
+    const id = await cm.ensureChannel();
+
+    expect(id).toBe(cm.deterministicChannelId());
+    expect(state.state.channelId).toBe(id);
+    expect(buzz.published.map((e) => e.kind)).toContain(9007);
+  });
+
   it("throws when the join is rejected because the channel is private", async () => {
     const { cm, buzz } = ctx;
     buzz.metadata = [
@@ -448,7 +473,7 @@ describe("re-run triggers (§3)", () => {
     expect(buzz.published.map((e) => e.kind)).toContain(9007);
   });
 
-  it("attachTriggers wires channelLost and reconnected on an emitting client", () => {
+  it("attachTriggers wires channelLost and authenticated on an emitting client", () => {
     const { cm } = setup();
     const wired: string[] = [];
     cm.attachTriggers({
@@ -456,6 +481,25 @@ describe("re-run triggers (§3)", () => {
         wired.push(event);
       },
     });
-    expect(wired).toEqual(["channelLost", "reconnected"]);
+    // `authenticated` is what BuzzClient actually emits after every AUTH;
+    // listening for a `reconnected` event nothing emits silently disabled the
+    // reconnect-side 39000 verification (§3).
+    expect(wired).toEqual(["channelLost", "authenticated"]);
+  });
+
+  it("attachTriggers verifies the channel on a real BuzzClient emit (§3)", async () => {
+    const { cm, buzz, state } = setup();
+    state.state.channelId = "77777777-0000-5000-8000-000000000000";
+    buzz.metadata = [];
+
+    // Drive the event name BuzzClient really emits, not a recorder stub.
+    const emitter = new EventEmitter();
+    cm.attachTriggers(emitter);
+    emitter.emit("authenticated");
+
+    await vi.waitFor(() => {
+      expect(buzz.published.map((e) => e.kind)).toContain(9007);
+    });
+    expect(state.state.channelId).toBe(cm.deterministicChannelId());
   });
 });

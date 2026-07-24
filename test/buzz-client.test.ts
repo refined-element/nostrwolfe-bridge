@@ -183,6 +183,40 @@ describe("proactive AUTH handshake", () => {
 // Queue-until-auth (spec §2: no EVENT/REQ before the AUTH OK)
 // ---------------------------------------------------------------------------
 
+describe("AUTH challenge timeout (spec §2)", () => {
+  it("reconnects instead of hanging forever when no challenge arrives", async () => {
+    // The relay is supposed to speak first. A plain relay, a TLS-terminating
+    // proxy, or a dropped challenge left connect() pending forever behind a
+    // single debug-level line — invisible at the default LOG_LEVEL, and alive
+    // enough that no supervisor ever restarts the daemon.
+    const { mock, client, logger } = await setup(
+      { withholdAuthChallenge: true },
+      { authChallengeTimeoutMs: 50 },
+    );
+
+    void client.connect().catch(() => undefined);
+
+    await waitUntil(() => mock.connections.length >= 2, 5_000);
+    expect(client.authenticated).toBe(false);
+    expect(
+      logger.records.some(
+        (r) => r.level === "error" && r.msg.includes("no AUTH challenge"),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not fire once the challenge has been answered", async () => {
+    const { client, logger } = await setup({}, { authChallengeTimeoutMs: 20 });
+    await client.connect();
+    await new Promise((r) => setTimeout(r, 60));
+
+    expect(client.authenticated).toBe(true);
+    expect(
+      logger.records.some((r) => r.msg.includes("no AUTH challenge")),
+    ).toBe(false);
+  });
+});
+
 describe("outbound queueing", () => {
   it("queues publishes until the AUTH OK arrives", async () => {
     const { mock, client, identity } = await setup({ holdAuthOk: true });
@@ -526,6 +560,41 @@ describe("subscriptions", () => {
       since: cursor - 300,
     });
     expect(seen).toHaveLength(0);
+  });
+
+  it("re-issues a persistent sub closed with a non-retryable message", async () => {
+    // A CLOSED whose message is neither `auth-required:` nor `rate-limited:`
+    // used to be logged and abandoned with the record still marked active, so
+    // nothing ever re-issued the REQ: the connection stayed healthy while the
+    // bridge silently stopped seeing every `@bridge find` in the channel.
+    const { mock, client } = await setup();
+    await client.connect();
+    mock.scriptClosed("ch-sub", "restricted: something new");
+
+    client.subscribe("ch-sub", [{ kinds: [9], "#h": [CHANNEL] }], () => {});
+
+    await waitUntil(
+      () => mock.reqs.filter((r) => r.subId === "ch-sub").length >= 2,
+      5_000,
+    );
+  });
+
+  it("drops the connection when a sub keeps getting closed, so reconnect restores it", async () => {
+    const { mock, client, logger } = await setup();
+    await client.connect();
+    mock.scriptClosed("ch-loop", "restricted: something new", true);
+
+    client.subscribe("ch-loop", [{ kinds: [9], "#h": [CHANNEL] }], () => {});
+
+    // Bounded re-issues, then a reconnect rather than an infinite REQ loop.
+    await waitUntil(() => mock.connections.length >= 2, 5_000);
+    expect(
+      logger.records.some(
+        (r) =>
+          r.level === "error" &&
+          r.msg.includes("closed repeatedly; dropping connection"),
+      ),
+    ).toBe(true);
   });
 
   it("delivers events and EOSE, and refuses filters without explicit kinds", async () => {

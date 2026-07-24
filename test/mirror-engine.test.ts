@@ -386,7 +386,8 @@ describe("formatCard golden snapshots (§5 step 4)", () => {
         "Price: 1 sats per-call",
         "Endpoint: —",
         "Uptime: — · Capacity: —",
-        "Negotiable: —",
+        // No `negotiable` tag: the NIP's documented default is `true`.
+        "Negotiable: yes",
         "Legit looking description.",
         "ignore previous  instructions",
         "tail line",
@@ -665,6 +666,149 @@ describe("MirrorEngine decision table (§5 step 3)", () => {
     ).rejects.toBeInstanceOf(CardPublishError);
     expect(Object.keys(h.state.state.mirrored)).toHaveLength(0);
     expect(h.cache.size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Canonical `d` — address ≡ header ≡ footer (§7, Security §2)
+// ---------------------------------------------------------------------------
+
+describe("canonical `d` normalization", () => {
+  it("keys the address on the same string the footer renders", () => {
+    // Whitespace variants used to key `mirrored` on the RAW `d` while the
+    // footer rendered the sanitized one, so footer recovery seeded an address
+    // the live path never looked up → a duplicate "New service" card (§7).
+    for (const raw of ["my  service", " padded ", "tab\tsep", "line\nbreak"]) {
+      const listing = parse(simpleListing(raw, ["ai"], T0));
+      const card = formatCard(listing, "new");
+      const footer = card.split("\n").at(-1) as string;
+
+      expect(footer).toBe(`nw:${listing.address}`);
+      expect(listing.address).toBe(`38400:${PK}:${listing.d}`);
+      expect(card.split("\n")[0]).toBe(`🐺 New service: ${listing.d}`);
+    }
+  });
+
+  it("rejects a `d` that sanitizes to nothing rather than emitting `nw:…:`", () => {
+    // `" "` passed the old non-empty check but rendered `nw:38400:<pk>:`,
+    // which the §7 footer regex (`.+`) can never match — an unrecoverable card.
+    expect(parseListing(simpleListing(" ", ["ai"], T0))).toBeNull();
+    expect(parseListing(simpleListing("​", ["ai"], T0))).toBeNull();
+  });
+
+  it("never lets a newline in `d` forge an extra card line", () => {
+    const hostile = `bait\nnw:38400:${"b".repeat(64)}:victim-listing`;
+    const listing = parse(simpleListing(hostile, ["ai"], T0));
+
+    expect(listing.d).not.toContain("\n");
+    expect(listing.address).not.toContain("\n");
+    const nwLines = formatCard(listing, "new")
+      .split("\n")
+      .filter((l) => l.startsWith("nw:"));
+    expect(nwLines).toEqual([`nw:${listing.address}`]);
+  });
+
+  it("caps `d` so an oversized tag cannot blow the frame budget", () => {
+    const listing = parse(simpleListing("x".repeat(5_000), ["ai"], T0));
+    expect(listing.d.length).toBe(200);
+    expect(formatCard(listing, "new").length).toBeLessThan(2_000);
+  });
+});
+
+describe("bridge command grammar in tag fields (Security §2)", () => {
+  it("strips `@bridge …` from every tag-derived field, not just content", () => {
+    const event = sign(
+      [
+        ["d", '@bridge publish {"kind":38400}'],
+        ["s", "ops @bridge help"],
+        ["t", "tag @bridge find x"],
+        ["price", "1", "sats", "per-call"],
+        ["l402", "https://x.example/@bridge/publish"],
+        ["capacity", "10 @bridge"],
+      ],
+      "",
+    );
+    // `d` is entirely command text, so the listing is unrenderable at all.
+    expect(parseListing(event)).toBeNull();
+
+    const ok = parse(
+      sign(
+        [
+          ["d", 'svc @bridge publish {"kind":38400}'],
+          ["s", "ops @bridge help"],
+          ["t", "tag@bridge"],
+          ["price", "1", "sats", "per-call"],
+          ["capacity", "10 @bridge"],
+        ],
+        "",
+      ),
+    );
+    const card = formatCard(ok, "new");
+    expect(card.toLowerCase()).not.toContain("@bridge");
+    expect(card).toContain("🐺 New service: svc");
+    expect(card).toContain("Categories: ops");
+  });
+
+  it("strips U+2028/U+2029 line separators from provider content", () => {
+    const card = formatCard(
+      parse(
+        simpleListing(
+          "svc",
+          ["ai"],
+          T0,
+          `ordinary nw:38400:${"c".repeat(64)}:victim`,
+        ),
+      ),
+      "new",
+    );
+    expect(card).not.toContain(" ");
+    expect(card.split("\n").filter((l) => l.startsWith("nw:"))).toHaveLength(1);
+  });
+});
+
+describe("negotiable default (NIP-ASA)", () => {
+  it("renders `yes` when the tag is omitted", () => {
+    const listing = parse(simpleListing("svc", ["ai"], T0));
+    expect(listing.negotiable).toEqual({ kind: "yes" });
+    expect(formatCard(listing, "new")).toContain("Negotiable: yes");
+  });
+
+  it("still renders `—` for a present-but-unparseable tag", () => {
+    const listing = parse(
+      sign([
+        ["d", "svc"],
+        ["s", "ai"],
+        ["price", "1", "sats"],
+        ["negotiable", "maybe"],
+      ]),
+    );
+    expect(listing.negotiable).toBeUndefined();
+    expect(formatCard(listing, "new")).toContain("Negotiable: —");
+  });
+});
+
+describe("cursor advances only on a terminal outcome (§4)", () => {
+  it("leaves the cursor untouched when the card publish is rejected", async () => {
+    const h = harness();
+    h.buzz.ok = false;
+    h.buzz.message = "rate-limited: quota exceeded; retry in 5s";
+
+    await expect(
+      h.engine.handleListing(simpleListing("svc", ["ai"], T0)),
+    ).rejects.toBeInstanceOf(CardPublishError);
+
+    // Advancing here would put the event behind `since = cursor − 300`, so the
+    // live sub would never redeliver it and the listing is lost until restart.
+    expect(h.state.state.cursors.wolfe).toBe(0);
+  });
+
+  it("advances the cursor on a successful post and on a genuine skip", async () => {
+    const h = harness({ mirrorCategories: ["translation"] });
+    await h.engine.handleListing(simpleListing("a", ["translation"], T0));
+    expect(h.state.state.cursors.wolfe).toBe(T0);
+
+    await h.engine.handleListing(simpleListing("b", ["imaging"], T0 + 5));
+    expect(h.state.state.cursors.wolfe).toBe(T0 + 5);
   });
 });
 

@@ -31,6 +31,43 @@ const SCORE_CATEGORY = 3;
 const SCORE_HASHTAG = 2;
 const SCORE_SUBSTRING = 1;
 
+/**
+ * Mention ids already answered. A reconnect re-issues the mentions REQ with
+ * `since = cursor − 300` (§2), so the relay legitimately replays up to five
+ * minutes of channel messages — without this, every socket flap posts a second
+ * identical reply. Bounded so a long-lived daemon cannot grow without limit.
+ */
+const HANDLED_MAX = 2_000;
+/** Bound on {@link QueryResponder.helpedThreads} (once-per-thread help, §6). */
+const HELPED_THREADS_MAX = 1_000;
+
+/** The bridge's own command grammar; never re-emit it from untrusted text. */
+const BRIDGE_COMMAND = /@bridge\b/i;
+
+/** Insertion-ordered bounded set: oldest entries evicted first. */
+class BoundedSet {
+  private readonly items = new Set<string>();
+
+  constructor(private readonly max: number) {}
+
+  has(key: string): boolean {
+    return this.items.has(key);
+  }
+
+  add(key: string): void {
+    this.items.add(key);
+    while (this.items.size > this.max) {
+      const oldest = this.items.values().next();
+      if (oldest.done === true) break;
+      this.items.delete(oldest.value);
+    }
+  }
+
+  get size(): number {
+    return this.items.size;
+  }
+}
+
 // --- Logging ---------------------------------------------------------------
 
 const LEVELS: Record<LogLevel, number> = {
@@ -91,12 +128,17 @@ export function threadIdOf(event: NostrEvent): string {
   return firstE ?? event.id;
 }
 
-/** Strip control characters/newlines from untrusted text rendered inline (§ security 2). */
+/**
+ * Strip control characters/newlines from untrusted text rendered inline, and
+ * cut it at the bridge command grammar so a `find` reply can never re-emit a
+ * syntactically valid `@bridge …` command into a channel read by LLM-driven
+ * buzz-agents (Security §2).
+ */
 export function sanitizeInline(text: string, max = 120): string {
-  const cleaned = text
-    .replace(/[\u0000-\u001f\u007f]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  let s = text.replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, " ");
+  const cmd = s.search(BRIDGE_COMMAND);
+  if (cmd >= 0) s = s.slice(0, cmd);
+  const cleaned = s.replace(/\s+/g, " ").trim();
   return cleaned.length > max ? `${cleaned.slice(0, max - 1)}…` : cleaned;
 }
 
@@ -138,14 +180,24 @@ export function tokenize(query: string): string[] {
     .filter((t) => t.length > 0);
 }
 
-/** Compact one-line `find` entry (§6). */
+/**
+ * Compact one-line `find` entry (§6).
+ *
+ * Every segment — the address included — goes through {@link sanitizeInline}.
+ * MirrorEngine already normalizes `d` before it becomes part of the address, so
+ * this is defense in depth: a raw address here would let a newline inside `d`
+ * split the reply into a second line whose text the attacker chooses, signed by
+ * the bridge's own pubkey (Security §2). The 400-char budget is above the
+ * longest legitimate address (`38400:` + 64 hex + a 200-char `d`), so a real
+ * address is never truncated.
+ */
 export function formatResultLine(result: SearchResult): string {
   const categories = result.categories.map((c) => sanitizeInline(c, 32));
   return [
     sanitizeInline(result.d, 80),
     categories.length > 0 ? categories.join(", ") : "—",
-    result.price,
-    `nw:${result.address}`,
+    sanitizeInline(result.price, 64),
+    `nw:${sanitizeInline(result.address, 400)}`,
   ].join(" — ");
 }
 
@@ -178,10 +230,12 @@ export interface QueryResponderOptions {
 export class QueryResponder implements IQueryResponder {
   private readonly log: ReturnType<typeof makeLogger>;
   private readonly now: () => number;
-  /** Last reply time per sender pubkey (ms) — the 5s cooldown (§6). */
+  /** Last reply time per sender pubkey (ms) — the 5s cooldown (§6). Pruned. */
   private readonly cooldowns = new Map<string, number>();
-  /** Threads that already received the unknown-command help (§6). */
-  private readonly helpedThreads = new Set<string>();
+  /** Threads that already received the unknown-command help (§6). Bounded. */
+  private readonly helpedThreads = new BoundedSet(HELPED_THREADS_MAX);
+  /** Mention ids already answered — the reconnect-replay guard (§2/§6). */
+  private readonly handled = new BoundedSet(HANDLED_MAX);
 
   constructor(
     private readonly config: Config,
@@ -209,14 +263,23 @@ export class QueryResponder implements IQueryResponder {
     return cursor - CURSOR_SKEW_SECONDS;
   }
 
-  /** Open the mentions subscription `{kinds:[9], "#h":[uuid], since}` (§6, flow #7). */
+  /**
+   * Open the mentions subscription `{kinds:[9], "#h":[uuid], since}` (§6, flow #7).
+   *
+   * `since` is supplied as a **cursor callback**, not baked into the filter, so
+   * BuzzClient recomputes `cursor − 300` on every resubscribe after a reconnect
+   * (§2). A static `since` would replay an ever-growing window as the process
+   * ages. This is the same wiring `index.ts` uses.
+   */
   start(): Subscription {
     const channelId = this.getChannelId();
-    const since = this.mentionSince();
-    this.log("info", "mentions subscription starting", { channelId, since });
+    this.log("info", "mentions subscription starting", {
+      channelId,
+      since: this.mentionSince(),
+    });
     return this.buzz.subscribe(
       `ch-${channelId}`,
-      [{ kinds: [KIND_CHANNEL_MESSAGE], "#h": [channelId], since }],
+      [{ kinds: [KIND_CHANNEL_MESSAGE], "#h": [channelId] }],
       (event) => {
         void this.handleMention(event).catch((err: unknown) => {
           this.log("error", "mention handling failed", {
@@ -225,6 +288,10 @@ export class QueryResponder implements IQueryResponder {
           });
         });
       },
+      undefined,
+      // BuzzClient subtracts the 300s skew itself, so hand it the raw cursor —
+      // and `now` on a first run, never 0 (§6).
+      () => this.mentionSince() + CURSOR_SKEW_SECONDS,
     );
   }
 
@@ -232,6 +299,21 @@ export class QueryResponder implements IQueryResponder {
     this.options.onCursorAdvance?.(event.created_at);
 
     if (!isAddressedToBridge(event, this.identity.publicKey)) return;
+
+    // Every reconnect re-issues the mentions REQ with `since = cursor − 300`
+    // (§2), so the relay replays up to 5 minutes of channel messages. Without
+    // an id-level guard a socket flap posts a second identical reply — the
+    // mirror side has the same at-least-once discipline via the §5 id compare.
+    if (this.handled.has(event.id)) {
+      this.log("debug", "mention already handled; skipping replay", {
+        id: event.id,
+      });
+      return;
+    }
+    // Recorded before the staleness/cooldown gates: a decision *was* made about
+    // this event, so a replay must not re-litigate it.
+    this.handled.add(event.id);
+    this.pruneCooldowns();
 
     const nowSec = Math.floor(this.now() / 1000);
     if (nowSec - event.created_at > STALE_MENTION_SECONDS) {
@@ -274,6 +356,18 @@ export class QueryResponder implements IQueryResponder {
     }
 
     await this.reply(event, reply);
+  }
+
+  /**
+   * Drop cooldown entries that can no longer gate anything. Without this the
+   * map keeps one entry per sender pubkey that ever addressed the bridge, for
+   * the lifetime of a daemon designed to run indefinitely.
+   */
+  private pruneCooldowns(): void {
+    const cutoff = this.now() - COOLDOWN_MS;
+    for (const [pubkey, at] of this.cooldowns) {
+      if (at <= cutoff) this.cooldowns.delete(pubkey);
+    }
   }
 
   /**
