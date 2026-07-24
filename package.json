@@ -1,14 +1,52 @@
 {
   "name": "nostrwolfe-bridge",
   "version": "0.1.0",
-  "private": true,
+  "description": "A daemon that mirrors the NostrWolfe agent-services marketplace (Nostr kind:38400) into a Buzz community channel, and lets members publish their own listings out to it.",
   "type": "module",
-  "description": "Standalone daemon mirroring the NostrWolfe public marketplace (kind:38400) into a Buzz community Services channel.",
+  "license": "MIT",
+  "author": "Lightning Enable (refined-element)",
+  "homepage": "https://github.com/refined-element/nostrwolfe-bridge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/refined-element/nostrwolfe-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/refined-element/nostrwolfe-bridge/issues"
+  },
+  "keywords": [
+    "nostr",
+    "nostrwolfe",
+    "buzz",
+    "lightning",
+    "l402",
+    "agent-commerce",
+    "marketplace",
+    "nip-29",
+    "relay",
+    "daemon"
+  ],
+  "bin": {
+    "nostrwolfe-bridge": "bin/cli.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "bin",
+    ".env.example",
+    "DESIGN.md",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "start": "node --env-file=.env dist/index.js",
-    "dev": "tsx src/index.ts"
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

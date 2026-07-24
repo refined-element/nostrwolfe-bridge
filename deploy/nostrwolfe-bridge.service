@@ -1,0 +1,17 @@
+# Template systemd user unit. Replace /ABSOLUTE/PATH/TO with your checkout path
+# and the node path (`which node`). Then see deploy/README.md.
+[Unit]
+Description=nostrwolfe-bridge — mirror the NostrWolfe marketplace into a Buzz community
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/ABSOLUTE/PATH/TO/nostrwolfe-bridge
+ExecStart=/ABSOLUTE/PATH/TO/node dist/index.js
+Restart=on-failure
+RestartSec=30
+# Logs to the journal: journalctl --user -u nostrwolfe-bridge -f
+
+[Install]
+WantedBy=default.target

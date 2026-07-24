@@ -6,3 +6,7 @@ bridge-state.json*
 
 # review artifacts
 .reviews/
+
+# runtime logs
+logs/
+logs-bridge.jsonl

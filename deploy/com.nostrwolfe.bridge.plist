@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template. Replace /ABSOLUTE/PATH/TO/nostrwolfe-bridge with your checkout path,
+  and /ABSOLUTE/PATH/TO/node with the output of `which node`. Then see deploy/README.md.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.nostrwolfe.bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/node</string>
+    <string>/ABSOLUTE/PATH/TO/nostrwolfe-bridge/dist/index.js</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/ABSOLUTE/PATH/TO/nostrwolfe-bridge</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>/ABSOLUTE/PATH/TO/nostrwolfe-bridge/logs/bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>/ABSOLUTE/PATH/TO/nostrwolfe-bridge/logs/bridge.err.log</string>
+</dict>
+</plist>
