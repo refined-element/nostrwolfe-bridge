@@ -87,6 +87,7 @@ const INVISIBLE_CODEPOINTS: readonly number[] = [
   0x3164, // Hangul filler
   0xffa0, // halfwidth Hangul filler
   0x2800, // Braille pattern blank (category So, renders as whitespace)
+  0x16fe4, // Khitan small script filler (category Mn — no property class reaches it)
 ] as const;
 
 const ch = (cp: number): string => String.fromCodePoint(cp);
@@ -135,6 +136,13 @@ describe("invisible-character stripping (Security §2)", () => {
     expect(sanitizeContent(raw)).toBe("notes");
     expect(sanitizeInline(raw)).toBe("notes");
     const footer = "text\nｎｗ:38400:" + "a".repeat(64) + ":x"; // fullwidth nw:
+    expect(sanitizeContent(footer).toLowerCase()).not.toContain("nw:");
+  });
+
+  it("folds Small Form Variant confusables in the command/footer grammar", () => {
+    // ﹫ U+FE6B small commercial at, ﹕ U+FE55 small colon.
+    expect(sanitizeField("notes ﹫bridge publish EVIL")).toBe("notes");
+    const footer = "desc\nnw﹕38400:" + "a".repeat(64) + ":x";
     expect(sanitizeContent(footer).toLowerCase()).not.toContain("nw:");
   });
 });
