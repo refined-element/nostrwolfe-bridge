@@ -314,6 +314,79 @@ describe("command grammar (§6)", () => {
       type: "unknown",
     });
   });
+
+  it("parses `publish` with the raw payload preserved (multi-line/JSON)", () => {
+    const { qr } = setup();
+    const payload = '{"kind":38400,"tags":[["d","x"]]}';
+    expect(qr.parseCommand(`@bridge publish ${payload}`)).toEqual({
+      type: "publish",
+      payload,
+    });
+    // A bare `publish` with no payload is unknown → help.
+    expect(qr.parseCommand("@bridge publish")).toEqual({ type: "unknown" });
+  });
+});
+
+// --- publish (§8, Phase 2) -------------------------------------------------
+
+describe("publish command routing (§8)", () => {
+  const AUTHOR = "b".repeat(64);
+
+  function setupPublish(handler?: (p: string, a: string) => Promise<string>) {
+    const buzz = new FakeBuzz();
+    const calls: { payload: string; author: string }[] = [];
+    const qr = new QueryResponder(
+      makeConfig(),
+      makeIdentity(),
+      buzz,
+      new FakeCache(),
+      () => CHANNEL_ID,
+      {
+        now: () => NOW_MS,
+        publishHandler:
+          handler ??
+          ((payload, author) => {
+            calls.push({ payload, author });
+            return Promise.resolve("Published nw:38400:xyz:svc — visible.");
+          }),
+      },
+    );
+    return { qr, buzz, calls };
+  }
+
+  it("routes the payload and the AUTHOR pubkey to the handler, and replies with its text", async () => {
+    const { qr, buzz, calls } = setupPublish();
+    const payload = '{"kind":38400}';
+    await qr.handleMention(
+      mention({ pubkey: AUTHOR, content: `@bridge publish ${payload}` }),
+    );
+    expect(calls).toEqual([{ payload, author: AUTHOR }]);
+    expect(buzz.published).toHaveLength(1);
+    expect(buzz.published[0]?.content).toContain("Published nw:38400:xyz:svc");
+    // Threaded reply on the mention.
+    expect(buzz.published[0]?.tags).toContainEqual([
+      "e",
+      "mention-1",
+      "",
+      "reply",
+    ]);
+  });
+
+  it("says publishing is disabled when no handler is wired", async () => {
+    const buzz = new FakeBuzz();
+    const qr = new QueryResponder(
+      makeConfig(),
+      makeIdentity(),
+      buzz,
+      new FakeCache(),
+      () => CHANNEL_ID,
+      { now: () => NOW_MS },
+    );
+    await qr.handleMention(
+      mention({ pubkey: AUTHOR, content: "@bridge publish {}" }),
+    );
+    expect(buzz.published[0]?.content).toContain("not enabled");
+  });
 });
 
 // --- search scoring --------------------------------------------------------

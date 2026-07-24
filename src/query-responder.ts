@@ -216,7 +216,9 @@ export function noMatchMessage(cachedCount: number): string {
 export const HELP_TEXT = [
   "🐺 nostrwolfe-bridge — commands:",
   "• `@bridge find <query>` — search mirrored NostrWolfe listings; replies with the top 5 matches.",
+  "• `@bridge publish <signed 38400 JSON>` — forward YOUR own signed kind:38400 to the public relay (must be signed by your key). Paste it raw or in a ```json fence.",
   "• `@bridge help` — this message.",
+  "Note: a message larger than ~64 KB is dropped by the relay before the bridge sees it, so an oversized publish gets no reply.",
   "Cards in this channel mirror public kind:38400 service listings; each card ends with its `nw:38400:<pubkey>:<d>` address.",
 ].join("\n");
 
@@ -228,6 +230,12 @@ export interface QueryResponderOptions {
   getCursor?: () => number;
   /** Invoked with each handled mention's `created_at` so the caller can persist it. */
   onCursorAdvance?: (createdAt: number) => void;
+  /**
+   * Handles `@bridge publish <payload>` (§8): validates the member's signed
+   * 38400 against `authorPubkey` and forwards it to the public relay, returning
+   * the in-thread reply text. Absent = publishing disabled.
+   */
+  publishHandler?: (payload: string, authorPubkey: string) => Promise<string>;
 }
 
 export class QueryResponder implements IQueryResponder {
@@ -354,6 +362,14 @@ export class QueryResponder implements IQueryResponder {
         results.length > 0
           ? results.map(formatResultLine).join("\n")
           : noMatchMessage(this.cache.size);
+    } else if (command.type === "publish") {
+      // §8: validate + forward the member's own signed 38400 to the public
+      // relay. `event.pubkey` is the authenticated author (Buzz pins it), so the
+      // handler enforces the listing is signed by that same identity. If no
+      // handler is wired (publish disabled), say so rather than silently ignore.
+      reply = this.options.publishHandler
+        ? await this.options.publishHandler(command.payload, event.pubkey)
+        : "Publishing is not enabled on this bridge.";
     } else if (command.type === "help") {
       reply = HELP_TEXT;
     } else {
@@ -423,6 +439,10 @@ export class QueryResponder implements IQueryResponder {
     if (word === "find") {
       if (rest.length === 0) return { type: "unknown" };
       return { type: "find", query: rest };
+    }
+    if (word === "publish") {
+      if (rest.length === 0) return { type: "unknown" };
+      return { type: "publish", payload: rest };
     }
     return { type: "unknown" };
   }

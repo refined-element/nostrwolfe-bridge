@@ -274,6 +274,8 @@ export type MirrorOutcome =
 /** Parsed `@bridge` command from a channel mention. */
 export type BridgeCommand =
   | { type: "find"; query: string }
+  /** `@bridge publish <signed 38400 JSON>` — forward a member's own listing (§8). */
+  | { type: "publish"; payload: string }
   | { type: "help" }
   /** Addressed to the bridge but not a recognized command → help once per thread. */
   | { type: "unknown" };

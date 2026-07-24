@@ -25,6 +25,7 @@ import { loadConfig, resolveIdentity } from "./config.js";
 import { recoverMirroredFromChannel } from "./footer-recovery.js";
 import { ListingCache } from "./listing-cache.js";
 import { CardPublishError, MirrorEngine } from "./mirror-engine.js";
+import { makePublishHandler } from "./outbound-publisher.js";
 import { QueryResponder } from "./query-responder.js";
 import { StateStore } from "./state-store.js";
 import {
@@ -441,6 +442,12 @@ export async function startBridge(
           if (createdAt > s.cursors.buzz) s.cursors.buzz = createdAt;
         });
       },
+      // §8 (Phase 2): `@bridge publish` forwards a member's own signed 38400 to
+      // the public relay. The handler signs nothing itself — it validates and
+      // relays the member-signed event.
+      publishHandler: makePublishHandler({
+        wolfeRelayUrl: config.wolfeRelayUrl,
+      }),
     },
   );
 
