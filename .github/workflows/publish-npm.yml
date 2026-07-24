@@ -1,0 +1,53 @@
+name: Publish to npm
+
+# Publishes nostrwolfe-bridge to the npm registry. Runs on a pushed version tag
+# (v1.2.3), which `npm version <patch|minor|major>` creates automatically, and
+# can also be run on demand via the Actions "Run workflow" button.
+#
+# Requires one repository secret:
+#   NPM_TOKEN — an npm *Automation* (or Granular) access token with
+#               read+write (publish) permission for this package. An Automation
+#               token bypasses 2FA, which is why CI can publish while the account
+#               uses a passkey.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # enables npm provenance attestation
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Publish (skip if this version is already on npm)
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "$NAME@$VERSION is already published — nothing to do."
+          else
+            echo "Publishing $NAME@$VERSION…"
+            npm publish --provenance --access public
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
