@@ -110,6 +110,7 @@ describe("validateConfig — defaults (spec §1 table)", () => {
       buzzMsgsPerMin: 30,
       stateFile: "./bridge-state.json",
       logLevel: "info",
+      staleListingDays: 30,
     });
   });
 
@@ -121,6 +122,7 @@ describe("validateConfig — defaults (spec §1 table)", () => {
     expect(CONFIG_DEFAULTS.MIRROR_MAX_LISTINGS).toBe("200");
     expect(CONFIG_DEFAULTS.BACKFILL_LIMIT).toBe("100");
     expect(CONFIG_DEFAULTS.BUZZ_MSGS_PER_MIN).toBe("30");
+    expect(CONFIG_DEFAULTS.STALE_LISTING_DAYS).toBe("30");
   });
 
   it("falls back to the default when a var is present but blank", () => {
@@ -142,6 +144,7 @@ describe("validateConfig — defaults (spec §1 table)", () => {
       BUZZ_MSGS_PER_MIN: "60",
       STATE_FILE: "/var/lib/bridge/state.json",
       LOG_LEVEL: "DEBUG",
+      STALE_LISTING_DAYS: "7",
     });
     expect(cfg).toMatchObject({
       bridgeNsec: HEX,
@@ -155,7 +158,17 @@ describe("validateConfig — defaults (spec §1 table)", () => {
       buzzMsgsPerMin: 60,
       stateFile: "/var/lib/bridge/state.json",
       logLevel: "debug",
+      staleListingDays: 7,
     });
+  });
+
+  it("rejects a non-positive STALE_LISTING_DAYS", () => {
+    const { config, errors } = validateConfig({
+      BRIDGE_NSEC: NSEC,
+      STALE_LISTING_DAYS: "0",
+    });
+    expect(config).toBeNull();
+    expect(errors.some((e) => e.startsWith("STALE_LISTING_DAYS:"))).toBe(true);
   });
 });
 

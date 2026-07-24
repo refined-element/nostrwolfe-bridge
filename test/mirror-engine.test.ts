@@ -1179,3 +1179,315 @@ describe("ListingCache", () => {
     expect(cache.size).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Listing lifecycle — pause / remove / expire (§3a-c) and NIP-09 deletion (§3b)
+// ---------------------------------------------------------------------------
+
+/** A second identity, for cross-author deletion tests. */
+const SK2 = new Uint8Array(32).fill(9);
+
+/** A 38400 carrying a `status` tag (§3a). */
+function statusListing(
+  d: string,
+  categories: string[],
+  status: string,
+  createdAt: number,
+): NostrEvent {
+  return sign(
+    [
+      ["d", d],
+      ...categories.map((c): NostrTag => ["s", c]),
+      ["price", "50", "sats", "per-request"],
+      ["status", status],
+    ],
+    "",
+    createdAt,
+  );
+}
+
+/** A 38400 carrying a NIP-40 `expiration` tag (§3c). */
+function expiringListing(
+  d: string,
+  categories: string[],
+  expiration: number,
+  createdAt: number,
+): NostrEvent {
+  return sign(
+    [
+      ["d", d],
+      ...categories.map((c): NostrTag => ["s", c]),
+      ["price", "50", "sats", "per-request"],
+      ["expiration", String(expiration)],
+    ],
+    "",
+    createdAt,
+  );
+}
+
+/** A NIP-09 kind:5 deletion referencing `coord`, signed by `sk` (default SK). */
+function deletionEvent(
+  coord: string,
+  createdAt: number,
+  sk: Uint8Array = SK,
+): NostrEvent {
+  return finalizeEvent(
+    { kind: 5, created_at: createdAt, tags: [["a", coord]], content: "" },
+    sk,
+  ) as unknown as NostrEvent;
+}
+
+describe("formatCard lifecycle notes (§3a-c)", () => {
+  it("renders paused / removed / expired as header + separator + footer only", () => {
+    const listing = parse(fullListingEvent());
+    for (const kind of ["paused", "removed", "expired"] as const) {
+      const header = {
+        paused: "Paused",
+        removed: "Removed",
+        expired: "Expired",
+      }[kind];
+      expect(formatCard(listing, kind)).toBe(
+        [
+          `🐺 ${header}: image-generation`,
+          "─",
+          `nw:38400:${PK}:image-generation`,
+        ].join("\n"),
+      );
+    }
+  });
+});
+
+describe("parseListing lifecycle tags (§3a, §3c)", () => {
+  it("parses status:inactive and status:removed, ignoring active/unknown", () => {
+    expect(parse(statusListing("a", ["ai"], "inactive", T0)).status).toBe(
+      "inactive",
+    );
+    expect(parse(statusListing("b", ["ai"], "removed", T0)).status).toBe(
+      "removed",
+    );
+    // active / unrecognized → undefined (treated active); never hides a listing.
+    expect(
+      parse(statusListing("c", ["ai"], "active", T0)).status,
+    ).toBeUndefined();
+    expect(
+      parse(statusListing("d", ["ai"], "bogus", T0)).status,
+    ).toBeUndefined();
+  });
+
+  it("parses a numeric expiration and ignores a non-numeric one", () => {
+    expect(
+      parse(expiringListing("a", ["ai"], 1_760_000_000, T0)).expiration,
+    ).toBe(1_760_000_000);
+    const bad = sign(
+      [
+        ["d", "b"],
+        ["s", "ai"],
+        ["price", "50", "sats"],
+        ["expiration", "soon"],
+      ],
+      "",
+      T0,
+    );
+    expect(parse(bad).expiration).toBeUndefined();
+  });
+});
+
+describe("MirrorEngine lifecycle — pause / remove / expire (§3a-c)", () => {
+  const addr = `38400:${PK}:svc`;
+
+  it("an active listing that becomes paused posts a Paused note and leaves the cache", async () => {
+    const h = harness();
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0));
+    expect(h.cache.has(addr)).toBe(true);
+
+    const outcome = await h.engine.handleListing(
+      statusListing("svc", ["ai"], "inactive", T0 + 60),
+    );
+    expect(outcome).toMatchObject({ type: "paused", address: addr });
+    expect(h.buzz.contents.at(-1)!.startsWith("🐺 Paused: svc")).toBe(true);
+    expect(h.cache.has(addr)).toBe(false);
+    expect(h.state.state.mirrored[addr]!.delisted).toBe(true);
+  });
+
+  it("a paused listing restores via a later active replacement (updated card)", async () => {
+    const h = harness();
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0));
+    await h.engine.handleListing(
+      statusListing("svc", ["ai"], "inactive", T0 + 60),
+    );
+
+    const outcome = await h.engine.handleListing(
+      simpleListing("svc", ["ai"], T0 + 120),
+    );
+    expect(outcome).toMatchObject({ type: "update", address: addr });
+    expect(h.buzz.contents.at(-1)!.startsWith("🐺 Updated: svc")).toBe(true);
+    expect(h.cache.has(addr)).toBe(true);
+    expect(h.state.state.mirrored[addr]!.delisted).toBe(false);
+  });
+
+  it("status:removed posts a Removed note and leaves the cache", async () => {
+    const h = harness();
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0));
+
+    const outcome = await h.engine.handleListing(
+      statusListing("svc", ["ai"], "removed", T0 + 60),
+    );
+    expect(outcome).toMatchObject({ type: "removed", address: addr });
+    expect(h.buzz.contents.at(-1)!.startsWith("🐺 Removed: svc")).toBe(true);
+    expect(h.cache.has(addr)).toBe(false);
+    expect(h.state.state.mirrored[addr]!.delisted).toBe(true);
+  });
+
+  it("an expired (NIP-40) replacement posts an Expired note and leaves the cache", async () => {
+    const now = () => T0 + 1000;
+    const h = harness({}, now);
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0));
+
+    // expiration in the past relative to the injected clock.
+    const outcome = await h.engine.handleListing(
+      expiringListing("svc", ["ai"], T0 + 500, T0 + 60),
+    );
+    expect(outcome).toMatchObject({ type: "expired", address: addr });
+    expect(h.buzz.contents.at(-1)!.startsWith("🐺 Expired: svc")).toBe(true);
+    expect(h.cache.has(addr)).toBe(false);
+  });
+
+  it("a future expiration keeps the listing active", async () => {
+    const now = () => T0 + 1000;
+    const h = harness({}, now);
+    const outcome = await h.engine.handleListing(
+      expiringListing("svc", ["ai"], T0 + 100_000, T0),
+    );
+    expect(outcome).toMatchObject({ type: "new", address: addr });
+    expect(h.cache.has(addr)).toBe(true);
+  });
+
+  it("an unknown listing that arrives already inactive posts nothing", async () => {
+    const h = harness();
+    const outcome = await h.engine.handleListing(
+      statusListing("svc", ["ai"], "removed", T0),
+    );
+    expect(outcome).toEqual({
+      type: "skip",
+      reason: "not-active",
+      address: addr,
+    });
+    expect(h.buzz.published).toHaveLength(0);
+    expect(h.cache.size).toBe(0);
+    expect(h.state.state.mirrored[addr]).toBeUndefined();
+  });
+
+  it("a replayed paused replacement posts no second note (idempotent)", async () => {
+    const h = harness();
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0));
+    const paused = statusListing("svc", ["ai"], "inactive", T0 + 60);
+    await h.engine.handleListing(paused);
+    const before = h.buzz.published.length;
+
+    const outcome = await h.engine.handleListing(paused);
+    expect(outcome).toMatchObject({ type: "skip" });
+    expect(h.buzz.published.length).toBe(before);
+  });
+
+  it("a kind:5 and a status:removed replacement produce a single Removed card", async () => {
+    const h = harness();
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0));
+
+    await h.engine.handleListing(
+      statusListing("svc", ["ai"], "removed", T0 + 60),
+    );
+    const removedCards = () =>
+      h.buzz.contents.filter((c) => c.startsWith("🐺 Removed:")).length;
+    expect(removedCards()).toBe(1);
+
+    // The belt-and-suspenders kind:5 that follows is a no-op.
+    const outcome = await h.engine.handleDeletion(deletionEvent(addr, T0 + 70));
+    expect(outcome).toEqual([]);
+    expect(removedCards()).toBe(1);
+  });
+});
+
+describe("MirrorEngine NIP-09 deletion (§3b)", () => {
+  const addr = `38400:${PK}:svc`;
+
+  it("a kind:5 from the listing's author removes a live listing", async () => {
+    const h = harness();
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0));
+
+    const outcomes = await h.engine.handleDeletion(
+      deletionEvent(addr, T0 + 60),
+    );
+    expect(outcomes).toEqual([
+      { type: "removed", address: addr, cardMsgId: expect.any(String) },
+    ]);
+    expect(h.buzz.contents.at(-1)!.startsWith("🐺 Removed: svc")).toBe(true);
+    expect(h.cache.has(addr)).toBe(false);
+    expect(h.state.state.mirrored[addr]!.delisted).toBe(true);
+  });
+
+  it("a kind:5 from a different key is ignored (no cross-author deletion)", async () => {
+    const h = harness();
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0));
+
+    // Signed by SK2 but referencing SK's listing address.
+    const outcomes = await h.engine.handleDeletion(
+      deletionEvent(addr, T0 + 60, SK2),
+    );
+    expect(outcomes).toEqual([]);
+    expect(h.buzz.published).toHaveLength(1); // only the original "new" card
+    expect(h.cache.has(addr)).toBe(true);
+    expect(h.state.state.mirrored[addr]!.delisted).toBe(false);
+  });
+
+  it("a replayed kind:5 is idempotent (no second Removed card)", async () => {
+    const h = harness();
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0));
+    await h.engine.handleDeletion(deletionEvent(addr, T0 + 60));
+    const before = h.buzz.published.length;
+
+    const outcomes = await h.engine.handleDeletion(
+      deletionEvent(addr, T0 + 70),
+    );
+    expect(outcomes).toEqual([]);
+    expect(h.buzz.published.length).toBe(before);
+  });
+
+  it("a kind:5 for an un-mirrored address is a no-op", async () => {
+    const h = harness();
+    const outcomes = await h.engine.handleDeletion(
+      deletionEvent(`38400:${PK}:never-seen`, T0),
+    );
+    expect(outcomes).toEqual([]);
+    expect(h.buzz.published).toHaveLength(0);
+  });
+
+  it("a kind:5 with a tampered signature is ignored", async () => {
+    const h = harness();
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0));
+    const forged = { ...deletionEvent(addr, T0 + 60), content: "tampered" };
+
+    const outcomes = await h.engine.handleDeletion(forged);
+    expect(outcomes).toEqual([]);
+    expect(h.cache.has(addr)).toBe(true);
+  });
+
+  it("a later active republish restores a kind:5-removed listing", async () => {
+    const h = harness();
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0));
+    await h.engine.handleDeletion(deletionEvent(addr, T0 + 10));
+    expect(h.cache.has(addr)).toBe(false);
+
+    const outcome = await h.engine.handleListing(
+      simpleListing("svc", ["ai"], T0 + 60),
+    );
+    expect(outcome).toMatchObject({ type: "update", address: addr });
+    expect(h.cache.has(addr)).toBe(true);
+  });
+
+  it("ignores a non-deletion event", async () => {
+    const h = harness();
+    expect(
+      await h.engine.handleDeletion(simpleListing("svc", ["ai"], T0)),
+    ).toEqual([]);
+  });
+});

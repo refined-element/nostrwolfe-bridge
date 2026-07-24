@@ -24,9 +24,14 @@ import { ChannelManager } from "./channel-manager.js";
 import { loadConfig, resolveIdentity } from "./config.js";
 import { recoverMirroredFromChannel } from "./footer-recovery.js";
 import { ListingCache } from "./listing-cache.js";
-import { CardPublishError, MirrorEngine } from "./mirror-engine.js";
+import {
+  CardPublishError,
+  DELETION_KIND,
+  MirrorEngine,
+} from "./mirror-engine.js";
 import { makePublishHandler } from "./outbound-publisher.js";
 import { QueryResponder } from "./query-responder.js";
+import { sweepStaleListings } from "./staleness.js";
 import { StateStore } from "./state-store.js";
 import {
   WolfeSubscriber,
@@ -64,6 +69,9 @@ const CHANNEL_RERUN_TIMEOUT_MS = 150_000;
 
 /** Operator-visible heartbeat cadence (finding H-1): one status line every 5 min. */
 const HEARTBEAT_INTERVAL_MS = 5 * 60_000;
+
+/** Staleness sweep cadence (§3d): scan `mirrored` for stale listings once a day. */
+const STALE_SWEEP_INTERVAL_MS = 24 * 60 * 60_000;
 
 /**
  * Thrown by the `channelId()` accessor while the Services channel is unresolved
@@ -452,14 +460,20 @@ export async function startBridge(
   );
 
   /**
-   * One 38400 through the mirror. A rejected card is not recorded, so the next
-   * 38400 for that address retries the post; `invalid: channel not found` has
-   * already triggered the ChannelManager re-run via the BuzzClient hook (§3).
+   * One wolfe event through the mirror. 38400s go through the decision table;
+   * kind:5 deletions (§3b) go through the NIP-09 take-down path. A rejected card
+   * is not recorded, so the event is retried on redelivery; `invalid: channel
+   * not found` has already triggered the ChannelManager re-run via the
+   * BuzzClient hook (§3).
    */
   const onListing = async (event: NostrEvent): Promise<void> => {
     lastListingAt = Date.now();
     try {
-      await mirror.handleListing(event);
+      if (event.kind === DELETION_KIND) {
+        await mirror.handleDeletion(event);
+      } else {
+        await mirror.handleListing(event);
+      }
     } catch (err) {
       if (err instanceof ChannelUnresolvedError) {
         // The Services channel is mid-re-run (channelId null), so this 38400
@@ -585,6 +599,35 @@ export async function startBridge(
   // A pure diagnostic must never hold the process open.
   if (typeof heartbeat.unref === "function") heartbeat.unref();
 
+  // Staleness sweep (§3d): once a day, flag active listings not refreshed in
+  // STALE_LISTING_DAYS. Unref'd (like the heartbeat) so it never holds an idle
+  // process open, and self-contained — a failed sweep is logged and retried on
+  // the next tick, never crashes the daemon.
+  const runStaleSweep = async (): Promise<void> => {
+    if (stopped) return;
+    try {
+      await sweepStaleListings({
+        state,
+        buzz,
+        channelId,
+        secretKey: identity.secretKey,
+        staleListingDays: config.staleListingDays,
+        now: () => Math.floor(Date.now() / 1000),
+        log: (level, msg, fields) => log[level](msg, fields),
+      });
+    } catch (err) {
+      if (err instanceof ChannelUnresolvedError) {
+        log.warn("staleness sweep skipped: Services channel unresolved", {});
+        return;
+      }
+      log.error("staleness sweep failed", { error: String(err) });
+    }
+  };
+  const staleSweep = setInterval(() => {
+    void runStaleSweep();
+  }, STALE_SWEEP_INTERVAL_MS);
+  if (typeof staleSweep.unref === "function") staleSweep.unref();
+
   // `flush()` now propagates write failures (finding M-3). A single transient
   // failure of this startup barrier must not abort the whole boot — it is
   // already logged at error via the store's `write-failed` warning, and the
@@ -614,6 +657,7 @@ export async function startBridge(
       if (stopped) return;
       stopped = true;
       clearInterval(heartbeat);
+      clearInterval(staleSweep);
       for (const timer of channelRerunTimers) clearTimeout(timer);
       channelRerunTimers.clear();
       mentionsSub?.close();

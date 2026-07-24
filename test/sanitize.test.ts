@@ -206,6 +206,11 @@ describe("card-chrome rejection in provider content", () => {
     expect(isCardChromeLine("🐺 New service: x")).toBe(true);
     expect(isCardChromeLine("🐺 Updated: x")).toBe(true);
     expect(isCardChromeLine("🐺 Delisted: x")).toBe(true);
+    // Lifecycle headers and the staleness digest are chrome too (§3a-d).
+    expect(isCardChromeLine("🐺 Paused: x")).toBe(true);
+    expect(isCardChromeLine("🐺 Removed: x")).toBe(true);
+    expect(isCardChromeLine("🐺 Expired: x")).toBe(true);
+    expect(isCardChromeLine("🐺 Stale listings: 3 not refreshed")).toBe(true);
     expect(isCardChromeLine("─")).toBe(true);
     // Even hidden behind invisibles / leading whitespace.
     expect(isCardChromeLine(`  ${ch(0x200b)}🐺 New service: x`)).toBe(true);
