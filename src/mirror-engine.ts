@@ -1170,16 +1170,35 @@ export class MirrorEngine implements IMirrorEngine {
   }
 
   /**
-   * Drop the oldest delisted tombstones beyond {@link delistedBudget}. Only
-   * ever removes *delisted* entries, so dedupe of live listings is untouched; a
-   * pruned address that reappears simply posts a fresh "new" card.
+   * Drop delisted tombstones beyond {@link delistedBudget}. Only ever removes
+   * *delisted* entries, so dedupe of live listings is untouched; a pruned address
+   * that reappears simply posts a fresh "new" card.
+   *
+   * Eviction is **speculative-first**, not purely oldest-first. A "speculative"
+   * tombstone is one with no card on the channel (`cardMsgId === ""`): the
+   * removal high-water mark recorded when a kind:5 references an address the
+   * bridge never mirrored (§3b). Author binding constrains only the pubkey, not
+   * the `d`, so an attacker can mint many of these under their own key — and if
+   * eviction were purely oldest-first, a burst dated far in the future would
+   * evict every genuine (carded) removal high-water mark, re-opening the
+   * resurrection those marks exist to prevent. Evicting speculative tombstones
+   * before genuine ones (oldest-first within each class) means such a flood can
+   * only churn its own bucket; a real removal a viewer was shown is never
+   * evicted by it.
    */
   private pruneTombstones(mirrored: MirroredMap): void {
     const limit = this.delistedBudget();
     const tombstones = Object.entries(mirrored).filter(([, e]) => e.delisted);
     if (tombstones.length <= limit) return;
     tombstones
-      .sort((a, b) => a[1].createdAt - b[1].createdAt)
+      .sort((a, b) => {
+        // Speculative (no card) evicted before genuine (carded) removals…
+        const aSpec = a[1].cardMsgId === "" ? 0 : 1;
+        const bSpec = b[1].cardMsgId === "" ? 0 : 1;
+        if (aSpec !== bSpec) return aSpec - bSpec;
+        // …then oldest-first within each class.
+        return a[1].createdAt - b[1].createdAt;
+      })
       .slice(0, tombstones.length - limit)
       .forEach(([addr]) => {
         delete mirrored[addr];

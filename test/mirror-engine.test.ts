@@ -1186,6 +1186,7 @@ describe("ListingCache", () => {
 
 /** A second identity, for cross-author deletion tests. */
 const SK2 = new Uint8Array(32).fill(9);
+const PK2 = getPublicKey(SK2);
 
 /** A 38400 carrying a `status` tag (§3a). */
 function statusListing(
@@ -1554,6 +1555,45 @@ describe("MirrorEngine NIP-09 deletion (§3b)", () => {
       { type: "removed", address: addr, cardMsgId: expect.any(String) },
     ]);
     expect(h.cache.has(addr)).toBe(false);
+  });
+
+  it("a flood of never-mirrored deletion tombstones cannot evict a genuine removal", async () => {
+    // Small cap → delistedBudget = floor(6/2) = 3.
+    const h = harness({ mirrorMaxListings: 6 });
+    const victimAddr = `38400:${PK}:victim`;
+
+    // Genuine removal: mirror, then kind:5-remove → posts a "Removed" card, so the
+    // tombstone carries a real cardMsgId.
+    await h.engine.handleListing(simpleListing("victim", ["ai"], T0));
+    await h.engine.handleDeletion(deletionEvent(victimAddr, T0 + 10));
+    expect(h.state.state.mirrored[victimAddr]!.cardMsgId).not.toBe("");
+
+    // Attacker floods never-mirrored tombstones under their OWN key (author binding
+    // only constrains the pubkey), each dated far in the future (newest).
+    const flood = Array.from(
+      { length: 10 },
+      (_, i) => `38400:${PK2}:spam-${i}`,
+    );
+    const del = finalizeEvent(
+      {
+        kind: 5,
+        created_at: T0 + 1000,
+        tags: flood.map((a) => ["a", a]),
+        content: "",
+      },
+      SK2,
+    ) as unknown as NostrEvent;
+    await h.engine.handleDeletion(del);
+
+    // The genuine (carded) removal high-water mark survives the flood…
+    expect(h.state.state.mirrored[victimAddr]).toBeDefined();
+    expect(h.state.state.mirrored[victimAddr]!.delisted).toBe(true);
+    // …so a replay of the victim's stale active 38400 still can't resurrect it.
+    const outcome = await h.engine.handleListing(
+      simpleListing("victim", ["ai"], T0),
+    );
+    expect(outcome).toMatchObject({ type: "skip" });
+    expect(h.cache.has(victimAddr)).toBe(false);
   });
 
   it("ignores a cross-author e-tag deletion", async () => {
