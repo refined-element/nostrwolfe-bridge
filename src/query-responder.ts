@@ -348,6 +348,14 @@ export class QueryResponder implements IQueryResponder {
       this.recordHandled(event);
       return;
     }
+    // Commit the cooldown *synchronously*, the instant the gate passes — before
+    // any await. `handleMention` is dispatched fire-and-forget, and the publish
+    // path then awaits a forward of up to OUTBOUND_OK_TIMEOUT_MS. If the cooldown
+    // were only written after that await (in reply()), a burst of concurrent
+    // `@bridge publish` from one sender would all pass this check with the map
+    // still empty and each open an unmetered outbound socket (TOCTOU). Writing
+    // here closes that race and still throttles a sender whose reply bounced.
+    this.cooldowns.set(event.pubkey, this.now());
 
     const command = this.parseCommand(event.content);
     let reply: string;
@@ -482,12 +490,12 @@ export class QueryResponder implements IQueryResponder {
    * (rate-limited / invalid / restricted) it logs at `error` — a dropped reply
    * is a user-visible failure, not a warning — naming the consequence and the
    * relay's message, and returns `false` so the caller leaves the mention
-   * unhandled and retriable (silent-failure H-4). The cooldown is set
-   * regardless of outcome so a sender whose replies keep bouncing is still
-   * throttled and cannot spin the bridge.
+   * unhandled and retriable (silent-failure H-4). The sender's cooldown was
+   * already committed at the gate in `handleMention` (synchronously, before any
+   * await), so a bounced reply is still throttled and the publish path can't be
+   * raced past the cooldown.
    */
   private async reply(parent: NostrEvent, content: string): Promise<boolean> {
-    this.cooldowns.set(parent.pubkey, this.now());
     const event = finalizeEvent(
       {
         kind: KIND_CHANNEL_MESSAGE,

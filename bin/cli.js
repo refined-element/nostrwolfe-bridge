@@ -7,6 +7,8 @@
 import { main } from "../dist/index.js";
 
 main().catch((err) => {
-  console.error(err);
+  // Log the message, not the raw error object — avoids dumping a full stack
+  // (which could carry incidental context) to stderr on a startup failure.
+  console.error(err instanceof Error ? err.message : String(err));
   process.exit(1);
 });

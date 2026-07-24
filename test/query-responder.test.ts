@@ -387,6 +387,29 @@ describe("publish command routing (§8)", () => {
     );
     expect(buzz.published[0]?.content).toContain("not enabled");
   });
+
+  it("commits the cooldown at the gate: a burst of concurrent publishes from one sender invokes the handler once (TOCTOU)", async () => {
+    let calls = 0;
+    // A slow handler: without the synchronous gate-time cooldown, every
+    // concurrent mention would slip past the check before the first write.
+    const slow = () =>
+      new Promise<string>((resolve) => {
+        calls += 1;
+        setTimeout(() => resolve("Published nw:38400:x:y — visible."), 20);
+      });
+    const { qr } = setupPublish(slow);
+    const burst = Array.from({ length: 5 }, (_, i) =>
+      qr.handleMention(
+        mention({
+          id: `pub-${i}`,
+          pubkey: AUTHOR,
+          content: '@bridge publish {"kind":38400}',
+        }),
+      ),
+    );
+    await Promise.all(burst);
+    expect(calls).toBe(1);
+  });
 });
 
 // --- search scoring --------------------------------------------------------

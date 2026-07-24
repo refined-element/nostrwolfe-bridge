@@ -191,6 +191,8 @@ export async function forwardToWolfe(
         }),
       timeoutMs,
     );
+    // Don't keep the event loop alive on account of a pending publish.
+    timer.unref?.();
 
     ws.on("open", () => ws.send(JSON.stringify(["EVENT", event])));
     ws.on("message", (raw: import("ws").RawData) => {
