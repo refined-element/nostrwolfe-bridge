@@ -79,6 +79,14 @@ const INVISIBLE_CODEPOINTS: readonly number[] = [
   0xe0041,
   0xe0061,
   0xe007f, // Tags block (ASCII smuggling)
+  // Zero-width codepoints that are NOT format chars, so \p{Cf} misses them —
+  // caught via \p{Default_Ignorable_Code_Point} and the explicit Braille blank
+  // (security-fresh re-review, sanitize.ts INVISIBLE).
+  0x115f, // Hangul choseong filler (category Lo, renders blank)
+  0x1160, // Hangul jungseong filler
+  0x3164, // Hangul filler
+  0xffa0, // halfwidth Hangul filler
+  0x2800, // Braille pattern blank (category So, renders as whitespace)
 ] as const;
 
 const ch = (cp: number): string => String.fromCodePoint(cp);
@@ -116,11 +124,18 @@ describe("invisible-character stripping (Security §2)", () => {
     expect(sanitizeContent(s)).toBe(s);
   });
 
-  it("normalizes to NFC before stripping (decomposed forms survive as NFC)", () => {
-    // "é" as e + U+0301 combining acute → single U+00E9 after NFC.
-    const decomposed = "café";
-    expect(sanitizeField(decomposed)).toBe("café");
-    expect("café".normalize("NFC")).toBe(sanitizeField(decomposed));
+  it("normalizes decomposed combining marks", () => {
+    const decomposed = "cafe\u0301"; // e + combining acute
+    expect(sanitizeField(decomposed)).toBe("cafe\u0301".normalize("NFKC"));
+  });
+
+  it("NFKC folds a fullwidth ＠bridge so the command cut fires (security-fresh)", () => {
+    const raw = "notes ＠bridge publish EVIL"; // U+FF20 FULLWIDTH COMMERCIAL AT
+    expect(sanitizeField(raw)).toBe("notes");
+    expect(sanitizeContent(raw)).toBe("notes");
+    expect(sanitizeInline(raw)).toBe("notes");
+    const footer = "text\nｎｗ:38400:" + "a".repeat(64) + ":x"; // fullwidth nw:
+    expect(sanitizeContent(footer).toLowerCase()).not.toContain("nw:");
   });
 });
 
