@@ -1,45 +1,1370 @@
 /** BuzzClient — NIP-42 auth, rate-limited publish, subscriptions (spec §2). */
 
+import { EventEmitter } from "node:events";
+import { finalizeEvent } from "nostr-tools/pure";
+import WebSocket from "ws";
+
 import type {
-  Config,
   BridgeIdentity,
+  Config,
   EoseHandler,
   EventHandler,
   IBuzzClient,
+  LogLevel,
   NostrEvent,
   NostrFilter,
   OkResult,
   Subscription,
 } from "./types.js";
 
-export class BuzzClient implements IBuzzClient {
-  constructor(_config: Config, _identity: BridgeIdentity) {
-    void _config;
-    void _identity;
+// ---------------------------------------------------------------------------
+// Constants (spec §2 + Error handling)
+// ---------------------------------------------------------------------------
+
+/** Max Buzz WS frame (ARCHITECTURE.md:161). Oversized frames are never sent. */
+export const MAX_FRAME_BYTES = 65_536;
+
+/** Clock-skew allowance subtracted from cursors on (re)subscribe (spec §2). */
+export const SINCE_SKEW_SECONDS = 300;
+
+/** NIP-42 auth event kind. */
+export const AUTH_KIND = 22242;
+
+/** Burst ceiling of the outbound token bucket: 5 sends/sec (spec §2). */
+export const BURST_PER_SECOND = 5;
+
+const RECONNECT_BASE_MS = 1_000;
+const RECONNECT_MAX_MS = 60_000;
+
+/**
+ * `auth-required: verification failed` is ambiguous (allowlist miss vs fail-closed
+ * DB error), so it is retried with reconnect + re-AUTH before going fatal.
+ * 15s base with full jitter spreads 5 attempts over roughly two minutes
+ * (spec Error handling).
+ */
+const VERIFICATION_FAILED_MAX_ATTEMPTS = 5;
+const VERIFICATION_RETRY_BASE_MS = 15_000;
+
+/** `rate-limited: too many concurrent requests` → backoff 1s, retry (spec table). */
+const CONCURRENT_RETRY_MS = 1_000;
+
+const DEFAULT_OK_TIMEOUT_MS = 30_000;
+const DEFAULT_QUERY_TIMEOUT_MS = 20_000;
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/**
+ * A condition the bridge cannot recover from on its own. Carries operator
+ * guidance verbatim from the spec's error table.
+ */
+export class BuzzFatalError extends Error {
+  readonly guidance: string;
+  readonly relayMessage: string;
+
+  constructor(message: string, guidance: string, relayMessage = "") {
+    super(`${message}\n${guidance}`);
+    this.name = "BuzzFatalError";
+    this.guidance = guidance;
+    this.relayMessage = relayMessage;
+  }
+}
+
+/** Outbound frame exceeded {@link MAX_FRAME_BYTES}; rejected locally, never sent. */
+export class FrameTooLargeError extends Error {
+  readonly bytes: number;
+
+  constructor(bytes: number) {
+    super(
+      `outbound frame is ${bytes} bytes, over the ${MAX_FRAME_BYTES}-byte Buzz WS frame cap; not sent`,
+    );
+    this.name = "FrameTooLargeError";
+    this.bytes = bytes;
+  }
+}
+
+/** Transient: the socket went away before the relay answered. Item stays queued. */
+class DisconnectedError extends Error {
+  constructor(message = "buzz connection lost before OK") {
+    super(message);
+    this.name = "DisconnectedError";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Logging seam
+// ---------------------------------------------------------------------------
+
+export interface Logger {
+  debug(msg: string, fields?: Record<string, unknown>): void;
+  info(msg: string, fields?: Record<string, unknown>): void;
+  warn(msg: string, fields?: Record<string, unknown>): void;
+  error(msg: string, fields?: Record<string, unknown>): void;
+}
+
+const LEVEL_ORDER: Record<LogLevel, number> = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+};
+
+/** Plain stdout JSON lines, pino-style levels (spec §1 `LOG_LEVEL`). */
+export function createConsoleLogger(level: LogLevel = "info"): Logger {
+  const emit = (
+    lvl: LogLevel,
+    msg: string,
+    fields?: Record<string, unknown>,
+  ) => {
+    if (LEVEL_ORDER[lvl] < LEVEL_ORDER[level]) return;
+    const line = JSON.stringify({
+      level: lvl,
+      time: new Date().toISOString(),
+      component: "buzz-client",
+      msg,
+      ...fields,
+    });
+    if (lvl === "error" || lvl === "warn") console.error(line);
+    else console.log(line);
+  };
+  return {
+    debug: (m, f) => emit("debug", m, f),
+    info: (m, f) => emit("info", m, f),
+    warn: (m, f) => emit("warn", m, f),
+    error: (m, f) => emit("error", m, f),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Token bucket (spec §2 outbound rate limiter)
+// ---------------------------------------------------------------------------
+
+/**
+ * Two-dimensional token bucket: `BUZZ_MSGS_PER_MIN` per minute *and*
+ * {@link BURST_PER_SECOND} per second. The relay allows 60 msgs/min + 10 WS
+ * events/sec for the human tier; half budget leaves headroom for retries.
+ */
+export class TokenBucket {
+  private minuteTokens: number;
+  private secondTokens: number;
+  private last: number;
+
+  constructor(
+    private readonly perMinute: number,
+    private readonly perSecond: number = BURST_PER_SECOND,
+    private readonly now: () => number = Date.now,
+  ) {
+    this.minuteTokens = perMinute;
+    this.secondTokens = perSecond;
+    this.last = now();
+  }
+
+  private refill(): void {
+    const t = this.now();
+    const elapsed = Math.max(0, t - this.last);
+    this.last = t;
+    this.minuteTokens = Math.min(
+      this.perMinute,
+      this.minuteTokens + (elapsed * this.perMinute) / 60_000,
+    );
+    this.secondTokens = Math.min(
+      this.perSecond,
+      this.secondTokens + (elapsed * this.perSecond) / 1_000,
+    );
+  }
+
+  /** Consume one token, returning 0. If unavailable, returns ms to wait. */
+  tryConsume(): number {
+    this.refill();
+    if (this.minuteTokens >= 1 && this.secondTokens >= 1) {
+      this.minuteTokens -= 1;
+      this.secondTokens -= 1;
+      return 0;
+    }
+    const waitMinute =
+      this.minuteTokens >= 1
+        ? 0
+        : ((1 - this.minuteTokens) * 60_000) / this.perMinute;
+    const waitSecond =
+      this.secondTokens >= 1
+        ? 0
+        : ((1 - this.secondTokens) * 1_000) / this.perSecond;
+    return Math.max(1, Math.ceil(Math.max(waitMinute, waitSecond)));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Hooks / options
+// ---------------------------------------------------------------------------
+
+export interface BuzzClientHooks {
+  /**
+   * Post-AUTH hook, run after every successful AUTH (initial connect and every
+   * reconnect). The bridge uses it to verify the stored channel UUID still
+   * resolves (spec §2 reconnect / §3 re-run triggers). Must tolerate being
+   * called before ChannelManager has ever run.
+   */
+  onAuthenticated?: () => Promise<void> | void;
+  /**
+   * `invalid: channel not found` — the sole publish-side ChannelManager re-run
+   * trigger (spec §3). Also emitted as the `channelLost` event.
+   */
+  onChannelLost?: () => Promise<void> | void;
+  /**
+   * `restricted: not a channel member` — attempt a kind:9021 join once.
+   * Resolve `true` if the join succeeded (the publish is then retried);
+   * `false`/absent goes fatal (spec Error handling).
+   */
+  onNotChannelMember?: () => Promise<boolean>;
+  /** Unrecoverable condition; also emitted as the `fatal` event. */
+  onFatal?: (error: BuzzFatalError) => void;
+}
+
+export interface BuzzClientOptions {
+  hooks?: BuzzClientHooks;
+  logger?: Logger;
+  /**
+   * Multiplier applied to reconnect backoff and rate-limit pauses only.
+   * Production leaves this at 1; tests scale it down to keep suites fast.
+   */
+  timeScale?: number;
+  /** How long to wait for an `OK` before dropping the connection. */
+  okTimeoutMs?: number;
+  /** How long a one-shot {@link BuzzClient.query} waits for EOSE. */
+  queryTimeoutMs?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Internal records
+// ---------------------------------------------------------------------------
+
+interface QueueItem {
+  event: NostrEvent;
+  frame: string;
+  resolve: (result: OkResult) => void;
+  reject: (error: Error) => void;
+  /** kind:9021 join already attempted for this item (spec Error handling). */
+  joinAttempted: boolean;
+  sends: number;
+}
+
+interface PendingOk {
+  resolve: (result: OkResult) => void;
+  reject: (error: Error) => void;
+  timer: NodeJS.Timeout;
+}
+
+interface SubRecord {
+  id: string;
+  filters: NostrFilter[];
+  onEvent: EventHandler;
+  onEose?: EoseHandler;
+  /** Caller-provided cursor source; `since` becomes `cursor − 300` (spec §2). */
+  since?: () => number;
+  active: boolean;
+  closed: boolean;
+}
+
+interface QueryRecord {
+  id: string;
+  filters: NostrFilter[];
+  events: NostrEvent[];
+  resolve: (events: NostrEvent[]) => void;
+  reject: (error: Error) => void;
+  retried: boolean;
+  /** REQ already on the wire; drives resend-on-reconnect vs first send. */
+  sent: boolean;
+  timer: NodeJS.Timeout;
+}
+
+type Status = "idle" | "connecting" | "ready" | "closed";
+
+// ---------------------------------------------------------------------------
+// Prefix helpers (spec Error handling table)
+// ---------------------------------------------------------------------------
+
+const P = {
+  authRequired: "auth-required:",
+  verificationFailed: "auth-required: verification failed",
+  notRelayMember: "restricted: not a relay member",
+  notChannelMember: "restricted: not a channel member",
+  channelPrivate: "restricted: channel is private",
+  restricted: "restricted:",
+  duplicate: "duplicate:",
+  channelNotFound: "invalid: channel not found",
+  rateLimited: "rate-limited:",
+  invalid: "invalid:",
+} as const;
+
+/** `rate-limited: quota exceeded; retry in Ns` → N seconds, else null. */
+export function parseRetryInSeconds(message: string): number | null {
+  const m = /retry in\s+(\d+(?:\.\d+)?)\s*s/i.exec(message);
+  if (!m?.[1]) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+const ALLOWLIST_GUIDANCE = [
+  "Operator action required: the relay refused the bridge's NIP-42 AUTH.",
+  "`BUZZ_PUBKEY_ALLOWLIST=true` must be exported BEFORE relay startup (NOSTR.md:31-32).",
+  "The allowlist row itself can be added at any time, no relay restart needed:",
+].join(" ");
+
+// ---------------------------------------------------------------------------
+// BuzzClient
+// ---------------------------------------------------------------------------
+
+/**
+ * Owns the single WebSocket to the Buzz relay.
+ *
+ * Emits: `authenticated`, `disconnected`, `channelLost`, `fatal`.
+ * (Events mirror {@link BuzzClientHooks}; use whichever is convenient.)
+ */
+export class BuzzClient extends EventEmitter implements IBuzzClient {
+  private readonly config: Config;
+  private readonly identity: BridgeIdentity;
+  private readonly hooks: BuzzClientHooks;
+  private readonly log: Logger;
+  private readonly timeScale: number;
+  private readonly okTimeoutMs: number;
+  private readonly queryTimeoutMs: number;
+  private readonly bucket: TokenBucket;
+
+  private ws: WebSocket | null = null;
+  private status: Status = "idle";
+
+  /** Challenge for the *current* connection; issued once per connection (spec §2). */
+  private challenge: string | null = null;
+  /** The single stored-challenge re-AUTH allowed per connection (spec §2). */
+  private authRetryUsed = false;
+  private authInFlight = false;
+
+  private reconnectAttempt = 0;
+  private verificationFailures = 0;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+
+  private fatalError: BuzzFatalError | null = null;
+  private connectPromise: Promise<void> | null = null;
+  private connectSettle: {
+    resolve: () => void;
+    reject: (e: Error) => void;
+  } | null = null;
+  private readyWaiters: Array<{
+    resolve: () => void;
+    reject: (e: Error) => void;
+  }> = [];
+
+  private readonly queue: QueueItem[] = [];
+  private pumping = false;
+  /** Rate-limit pause deadline (`retry in Ns`); the queue never drops items. */
+  private resumeAt = 0;
+
+  private readonly pending = new Map<string, PendingOk>();
+  private readonly subs = new Map<string, SubRecord>();
+  private readonly queries = new Map<string, QueryRecord>();
+  private querySeq = 0;
+
+  constructor(
+    config: Config,
+    identity: BridgeIdentity,
+    options: BuzzClientOptions = {},
+  ) {
+    super();
+    this.config = config;
+    this.identity = identity;
+    this.hooks = options.hooks ?? {};
+    this.log = options.logger ?? createConsoleLogger(config.logLevel);
+    this.timeScale = options.timeScale ?? 1;
+    this.okTimeoutMs = options.okTimeoutMs ?? DEFAULT_OK_TIMEOUT_MS;
+    this.queryTimeoutMs = options.queryTimeoutMs ?? DEFAULT_QUERY_TIMEOUT_MS;
+    this.bucket = new TokenBucket(config.buzzMsgsPerMin, BURST_PER_SECOND);
+  }
+
+  // -- public surface -------------------------------------------------------
+
+  /** True once the proactive-AUTH handshake has been answered with OK-true. */
+  get authenticated(): boolean {
+    return this.status === "ready";
+  }
+
+  /** Number of publishes waiting on the rate limiter / auth / retries. */
+  get queueLength(): number {
+    return this.queue.length;
   }
 
   connect(): Promise<void> {
-    throw new Error("not implemented");
+    if (this.fatalError) return Promise.reject(this.fatalError);
+    if (this.status === "closed") {
+      return Promise.reject(new Error("BuzzClient is closed"));
+    }
+    if (!this.connectPromise) {
+      this.connectPromise = new Promise<void>((resolve, reject) => {
+        this.connectSettle = { resolve, reject };
+      });
+      this.openSocket();
+    }
+    return this.connectPromise;
   }
 
-  publish(_event: NostrEvent): Promise<OkResult> {
-    throw new Error("not implemented");
+  publish(event: NostrEvent): Promise<OkResult> {
+    // §2 frame budget: reject locally, never put an oversized frame on the wire.
+    const frame = JSON.stringify(["EVENT", event]);
+    const bytes = Buffer.byteLength(frame, "utf8");
+    if (bytes > MAX_FRAME_BYTES) {
+      const err = new FrameTooLargeError(bytes);
+      this.log.error("outbound frame too large; dropped locally", {
+        eventId: event.id,
+        kind: event.kind,
+        bytes,
+        max: MAX_FRAME_BYTES,
+      });
+      return Promise.reject(err);
+    }
+    if (this.fatalError) return Promise.reject(this.fatalError);
+    if (this.status === "closed") {
+      return Promise.reject(new Error("BuzzClient is closed"));
+    }
+    return new Promise<OkResult>((resolve, reject) => {
+      this.queue.push({
+        event,
+        frame,
+        resolve,
+        reject,
+        joinAttempted: false,
+        sends: 0,
+      });
+      void this.pump();
+    });
   }
 
+  /**
+   * Send an event immediately, bypassing the outbound queue and token bucket.
+   *
+   * Only for events published from **inside** a failure hook: those run on the
+   * publish pump's own stack, so a queued publish there would wait for a pump
+   * that is itself waiting for the hook. Today that is exactly the kind:9021
+   * join triggered by `restricted: not a channel member` (spec Error handling).
+   * Everything else must go through {@link publish}.
+   */
+  publishNow(event: NostrEvent): Promise<OkResult> {
+    const frame = JSON.stringify(["EVENT", event]);
+    const bytes = Buffer.byteLength(frame, "utf8");
+    if (bytes > MAX_FRAME_BYTES) {
+      return Promise.reject(new FrameTooLargeError(bytes));
+    }
+    if (this.fatalError) return Promise.reject(this.fatalError);
+    if (this.status !== "ready") {
+      return Promise.reject(new DisconnectedError("not authenticated"));
+    }
+    return this.awaitOk(event.id, frame);
+  }
+
+  /**
+   * @param since Optional cursor source. When given, every filter is (re)issued
+   * with `since = cursor − 300`, including after a reconnect (spec §2).
+   */
   subscribe(
-    _subId: string,
-    _filters: NostrFilter[],
-    _onEvent: EventHandler,
-    _onEose?: EoseHandler,
+    subId: string,
+    filters: NostrFilter[],
+    onEvent: EventHandler,
+    onEose?: EoseHandler,
+    since?: () => number,
   ): Subscription {
-    throw new Error("not implemented");
+    assertExplicitKinds(filters);
+    const record: SubRecord = {
+      id: subId,
+      filters,
+      onEvent,
+      ...(onEose ? { onEose } : {}),
+      ...(since ? { since } : {}),
+      active: false,
+      closed: false,
+    };
+    this.subs.set(subId, record);
+    if (this.status === "ready") this.sendReq(record);
+    return {
+      id: subId,
+      close: () => {
+        record.closed = true;
+        this.subs.delete(subId);
+        if (this.status === "ready" && record.active) {
+          this.trySendFrame(JSON.stringify(["CLOSE", subId]));
+        }
+      },
+    };
   }
 
-  query(_subId: string, _filters: NostrFilter[]): Promise<NostrEvent[]> {
-    throw new Error("not implemented");
+  query(subId: string, filters: NostrFilter[]): Promise<NostrEvent[]> {
+    try {
+      assertExplicitKinds(filters);
+    } catch (err) {
+      return Promise.reject(err as Error);
+    }
+    // Sub ids must be unique on the wire; callers reuse logical ids across runs.
+    const wireId = this.queries.has(subId)
+      ? `${subId}-${++this.querySeq}`
+      : subId;
+    return new Promise<NostrEvent[]>((resolve, reject) => {
+      const record: QueryRecord = {
+        id: wireId,
+        filters,
+        events: [],
+        resolve,
+        reject,
+        retried: false,
+        sent: false,
+        timer: setTimeout(() => {
+          this.queries.delete(wireId);
+          reject(new Error(`query ${wireId} timed out waiting for EOSE`));
+        }, this.queryTimeoutMs),
+      };
+      this.queries.set(wireId, record);
+      void this.startQuery(record);
+    });
   }
 
   close(): void {
-    throw new Error("not implemented");
+    this.status = "closed";
+    this.closeSocket();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const err = this.fatalError ?? new Error("BuzzClient closed");
+    this.failEverything(err);
   }
+
+  // -- connection lifecycle -------------------------------------------------
+
+  private openSocket(): void {
+    if (this.status === "closed" || this.fatalError) return;
+    this.status = "connecting";
+    this.challenge = null;
+    this.authRetryUsed = false;
+    this.authInFlight = false;
+
+    const url = this.config.buzzRelayUrl;
+    this.log.debug("connecting to buzz relay", { url });
+    const ws = new WebSocket(url);
+    this.ws = ws;
+
+    ws.on("open", () => {
+      this.log.debug("buzz socket open; awaiting proactive AUTH challenge", {
+        url,
+      });
+    });
+    ws.on("message", (data: WebSocket.RawData) => {
+      if (this.ws !== ws) return;
+      this.onMessage(data.toString());
+    });
+    ws.on("error", (err: Error) => {
+      this.log.warn("buzz socket error", { error: err.message });
+    });
+    ws.on("close", (code: number) => {
+      if (this.ws !== ws) return;
+      this.ws = null;
+      this.onSocketClosed(code);
+    });
+  }
+
+  private onSocketClosed(code: number): void {
+    const wasReady = this.status === "ready";
+    if (this.status !== "closed") this.status = "connecting";
+    this.challenge = null;
+    this.authInFlight = false;
+    for (const sub of this.subs.values()) sub.active = false;
+
+    const err = new DisconnectedError(`buzz socket closed (code ${code})`);
+    for (const [, p] of this.pending) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+    this.pending.clear();
+
+    // In-flight queries retry once on the next connection.
+    for (const record of [...this.queries.values()]) {
+      if (record.retried) {
+        clearTimeout(record.timer);
+        this.queries.delete(record.id);
+        record.reject(err);
+      } else {
+        record.retried = true;
+        record.events = [];
+      }
+    }
+
+    if (wasReady) this.log.warn("buzz connection lost", { code });
+    this.emit("disconnected", code);
+    if (this.status === "closed" || this.fatalError) return;
+    this.scheduleReconnect();
+  }
+
+  /** Exponential backoff 1s → 60s cap, full jitter, infinite retries (spec §2). */
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer) return;
+    const base =
+      this.verificationFailures > 0
+        ? VERIFICATION_RETRY_BASE_MS * 2 ** (this.verificationFailures - 1)
+        : RECONNECT_BASE_MS * 2 ** this.reconnectAttempt;
+    const capped = Math.min(RECONNECT_MAX_MS, base);
+    const delay = Math.random() * capped * this.timeScale;
+    this.reconnectAttempt += 1;
+    this.log.debug("scheduling buzz reconnect", {
+      attempt: this.reconnectAttempt,
+      delayMs: Math.round(delay),
+      verificationFailures: this.verificationFailures,
+    });
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.openSocket();
+    }, delay);
+  }
+
+  private closeSocket(): void {
+    const ws = this.ws;
+    this.ws = null;
+    if (!ws) return;
+    try {
+      ws.removeAllListeners();
+      ws.close();
+      ws.terminate();
+    } catch {
+      /* already gone */
+    }
+  }
+
+  /** Drop the connection so the next AUTH gets a fresh challenge (spec §2). */
+  private dropConnection(reason: string): void {
+    this.log.warn("dropping buzz connection", { reason });
+    const ws = this.ws;
+    this.closeSocket();
+    if (ws) {
+      // Synthesize the close path we detached from above.
+      this.onSocketClosed(4000);
+    }
+  }
+
+  // -- wire ----------------------------------------------------------------
+
+  private onMessage(raw: string): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      this.log.warn("unparseable frame from buzz relay", {
+        preview: raw.slice(0, 120),
+      });
+      return;
+    }
+    if (!Array.isArray(parsed) || typeof parsed[0] !== "string") return;
+    const arr = parsed as unknown[];
+    const type = arr[0] as string;
+
+    switch (type) {
+      case "AUTH": {
+        const challenge = arr[1];
+        if (typeof challenge !== "string") return;
+        this.challenge = challenge;
+        this.log.debug("received proactive AUTH challenge");
+        void this.runAuth();
+        return;
+      }
+      case "OK": {
+        const id = arr[1];
+        const ok = arr[2];
+        const message = arr[3];
+        if (typeof id !== "string" || typeof ok !== "boolean") return;
+        const p = this.pending.get(id);
+        if (!p) {
+          this.log.debug("OK for unknown event id", { id });
+          return;
+        }
+        this.pending.delete(id);
+        clearTimeout(p.timer);
+        p.resolve({
+          id,
+          ok,
+          message: typeof message === "string" ? message : "",
+        });
+        return;
+      }
+      case "EVENT": {
+        const subId = arr[1];
+        const event = arr[2];
+        if (typeof subId !== "string" || !isNostrEvent(event)) return;
+        const q = this.queries.get(subId);
+        if (q) {
+          q.events.push(event);
+          return;
+        }
+        const sub = this.subs.get(subId);
+        if (!sub || sub.closed) return;
+        try {
+          sub.onEvent(event);
+        } catch (err) {
+          this.log.error("subscription handler threw", {
+            subId,
+            error: (err as Error).message,
+          });
+        }
+        return;
+      }
+      case "EOSE": {
+        const subId = arr[1];
+        if (typeof subId !== "string") return;
+        const q = this.queries.get(subId);
+        if (q) {
+          clearTimeout(q.timer);
+          this.queries.delete(subId);
+          this.trySendFrame(JSON.stringify(["CLOSE", subId]));
+          q.resolve(q.events);
+          return;
+        }
+        const sub = this.subs.get(subId);
+        sub?.onEose?.();
+        return;
+      }
+      case "CLOSED": {
+        const subId = arr[1];
+        const message = arr[2];
+        if (typeof subId !== "string") return;
+        void this.handleClosed(
+          subId,
+          typeof message === "string" ? message : "",
+        );
+        return;
+      }
+      case "NOTICE": {
+        this.log.info("relay notice", { notice: String(arr[1] ?? "") });
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  private trySendFrame(frame: string): boolean {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    if (Buffer.byteLength(frame, "utf8") > MAX_FRAME_BYTES) {
+      this.log.error("outbound frame too large; not sent", {
+        bytes: Buffer.byteLength(frame, "utf8"),
+        max: MAX_FRAME_BYTES,
+      });
+      return false;
+    }
+    ws.send(frame);
+    return true;
+  }
+
+  private awaitOk(id: string, frame: string): Promise<OkResult> {
+    return new Promise<OkResult>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(
+          new DisconnectedError(`no OK for ${id} within ${this.okTimeoutMs}ms`),
+        );
+        this.dropConnection("OK timeout");
+      }, this.okTimeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      if (!this.trySendFrame(frame)) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(new DisconnectedError("socket not open"));
+      }
+    });
+  }
+
+  // -- AUTH (spec §2) -------------------------------------------------------
+
+  private buildAuthEvent(challenge: string): NostrEvent {
+    // Tags: challenge + relay with the DIALED url verbatim — the relay
+    // URL-normalizes both sides (nip42.rs:47-64), so verbatim is correct for
+    // local dev and required to match the community host when hosted (§2).
+    return finalizeEvent(
+      {
+        kind: AUTH_KIND,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [
+          ["challenge", challenge],
+          ["relay", this.config.buzzRelayUrl],
+        ],
+        content: "",
+      },
+      this.identity.secretKey,
+    ) as unknown as NostrEvent;
+  }
+
+  private async sendAuth(challenge: string): Promise<OkResult> {
+    const event = this.buildAuthEvent(challenge);
+    return this.awaitOk(event.id, JSON.stringify(["AUTH", event]));
+  }
+
+  private async runAuth(): Promise<void> {
+    if (this.authInFlight) return;
+    const challenge = this.challenge;
+    if (!challenge) return;
+    this.authInFlight = true;
+    try {
+      let res: OkResult;
+      try {
+        res = await this.sendAuth(challenge);
+      } catch (err) {
+        this.log.warn("AUTH send failed", { error: (err as Error).message });
+        return;
+      }
+      if (res.ok) {
+        await this.completeAuth();
+        return;
+      }
+      if (isVerificationFailed(res.message)) {
+        this.onVerificationFailed(res.message);
+        return;
+      }
+      // Generic rejection: one retry with the STORED challenge (issued once per
+      // connection), then drop the connection to obtain a fresh one (§2).
+      if (!this.authRetryUsed) {
+        this.authRetryUsed = true;
+        this.log.warn("AUTH rejected; retrying once with stored challenge", {
+          message: res.message,
+        });
+        let retry: OkResult;
+        try {
+          retry = await this.sendAuth(challenge);
+        } catch (err) {
+          this.log.warn("AUTH retry send failed", {
+            error: (err as Error).message,
+          });
+          return;
+        }
+        if (retry.ok) {
+          await this.completeAuth();
+          return;
+        }
+        if (isVerificationFailed(retry.message)) {
+          this.onVerificationFailed(retry.message);
+          return;
+        }
+      }
+      this.dropConnection(`AUTH rejected: ${res.message}`);
+    } finally {
+      this.authInFlight = false;
+    }
+  }
+
+  private async completeAuth(): Promise<void> {
+    this.status = "ready";
+    this.reconnectAttempt = 0;
+    this.verificationFailures = 0;
+    this.log.info("authenticated with buzz relay", {
+      url: this.config.buzzRelayUrl,
+      pubkey: this.identity.publicKey,
+    });
+    this.emit("authenticated");
+
+    for (const sub of this.subs.values()) {
+      if (!sub.closed) this.sendReq(sub);
+    }
+    for (const record of this.queries.values()) {
+      // Re-issue already-sent one-shot REQs from scratch on the new connection.
+      // Not-yet-sent ones are sent by startQuery once waitReady() resolves.
+      if (!record.sent) continue;
+      record.events = [];
+      this.sendReqFrame(record.id, record.filters);
+    }
+
+    const waiters = this.readyWaiters;
+    this.readyWaiters = [];
+    for (const w of waiters) w.resolve();
+    void this.pump();
+
+    // Post-AUTH hook: channel verification on every reconnect (§2/§3).
+    try {
+      await this.hooks.onAuthenticated?.();
+    } catch (err) {
+      this.log.error("post-auth hook threw", {
+        error: (err as Error).message,
+      });
+    }
+
+    const settle = this.connectSettle;
+    this.connectSettle = null;
+    settle?.resolve();
+  }
+
+  /**
+   * `auth-required: verification failed` — ambiguous (allowlist miss vs
+   * fail-closed DB error). Backoff-reconnect + re-AUTH up to
+   * {@link VERIFICATION_FAILED_MAX_ATTEMPTS}, then fatal with guidance.
+   */
+  private onVerificationFailed(message: string): void {
+    this.verificationFailures += 1;
+    if (this.verificationFailures >= VERIFICATION_FAILED_MAX_ATTEMPTS) {
+      this.fatal(
+        `buzz relay rejected AUTH with "${message}" ${this.verificationFailures} times`,
+        `${ALLOWLIST_GUIDANCE} INSERT INTO pubkey_allowlist (pubkey) VALUES (decode('${this.identity.publicKey}','hex'));`,
+        message,
+      );
+      return;
+    }
+    this.log.warn("AUTH verification failed; will reconnect and retry", {
+      attempt: this.verificationFailures,
+      max: VERIFICATION_FAILED_MAX_ATTEMPTS,
+      message,
+    });
+    this.dropConnection(`auth verification failed (${message})`);
+  }
+
+  private waitReady(): Promise<void> {
+    if (this.fatalError) return Promise.reject(this.fatalError);
+    if (this.status === "closed") {
+      return Promise.reject(new Error("BuzzClient is closed"));
+    }
+    if (this.status === "ready") return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      this.readyWaiters.push({ resolve, reject });
+    });
+  }
+
+  // -- subscriptions --------------------------------------------------------
+
+  private resolveFilters(sub: SubRecord): NostrFilter[] {
+    if (!sub.since) return sub.filters;
+    const cursor = sub.since();
+    const since = Math.max(0, Math.floor(cursor) - SINCE_SKEW_SECONDS);
+    return sub.filters.map((f) => ({ ...f, since }));
+  }
+
+  private sendReq(sub: SubRecord): void {
+    if (this.sendReqFrame(sub.id, this.resolveFilters(sub))) sub.active = true;
+  }
+
+  private sendReqFrame(subId: string, filters: NostrFilter[]): boolean {
+    return this.trySendFrame(JSON.stringify(["REQ", subId, ...filters]));
+  }
+
+  private async startQuery(record: QueryRecord): Promise<void> {
+    try {
+      await this.waitReady();
+    } catch (err) {
+      clearTimeout(record.timer);
+      this.queries.delete(record.id);
+      record.reject(err as Error);
+      return;
+    }
+    if (!this.queries.has(record.id) || record.sent) return;
+    record.sent = true;
+    this.sendReqFrame(record.id, record.filters);
+  }
+
+  /** CLOSED carries the same prefix vocabulary as OK-false (spec Error handling). */
+  private async handleClosed(subId: string, message: string): Promise<void> {
+    const query = this.queries.get(subId);
+    const sub = this.subs.get(subId);
+    if (!query && !sub) return;
+
+    const retryable =
+      message.startsWith(P.authRequired) || message.startsWith(P.rateLimited);
+
+    this.log.warn("subscription CLOSED by relay", { subId, message });
+
+    if (message.startsWith(P.notRelayMember)) {
+      this.fatal(
+        `buzz relay closed ${subId}: ${message}`,
+        "Add the bridge as a relay member: `buzz-admin add-member <npub>` (NOSTR.md:210-297).",
+        message,
+      );
+      return;
+    }
+    if (message.startsWith(P.channelPrivate)) {
+      this.fatal(
+        `buzz relay closed ${subId}: ${message}`,
+        "The Services channel exists but is private; the bridge will not force its way in. Re-create it as an open channel or grant the bridge membership.",
+        message,
+      );
+      return;
+    }
+    if (message.startsWith(P.notChannelMember)) {
+      const joined =
+        (await this.hooks.onNotChannelMember?.().catch(() => false)) ?? false;
+      if (joined) {
+        if (sub) this.sendReq(sub);
+        else if (query) this.sendReqFrame(query.id, query.filters);
+        return;
+      }
+      this.fatal(
+        `buzz relay closed ${subId}: ${message}`,
+        "kind:9021 join did not take; the bridge cannot read the channel. Check channel membership.",
+        message,
+      );
+      return;
+    }
+
+    if (!retryable) {
+      if (query) {
+        clearTimeout(query.timer);
+        this.queries.delete(subId);
+        query.reject(new Error(`REQ ${subId} closed: ${message}`));
+      }
+      return;
+    }
+
+    if (message.startsWith(P.authRequired)) {
+      if (isVerificationFailed(message)) {
+        this.onVerificationFailed(message);
+        return;
+      }
+      await this.reauthOnce(message);
+    } else {
+      const seconds = parseRetryInSeconds(message);
+      await this.delay(
+        seconds !== null ? seconds * 1_000 : CONCURRENT_RETRY_MS,
+      );
+    }
+
+    if (this.status !== "ready") return; // resubscribe happens after re-AUTH
+    if (sub && !sub.closed) this.sendReq(sub);
+    else if (query && this.queries.has(subId)) {
+      this.sendReqFrame(query.id, query.filters);
+    }
+  }
+
+  /**
+   * Stored-challenge re-AUTH, once per connection; a second failure drops the
+   * connection so backoff-reconnect can fetch a fresh challenge (spec §2).
+   */
+  private async reauthOnce(reason: string): Promise<void> {
+    const challenge = this.challenge;
+    if (this.status !== "ready" || !challenge) return;
+    if (this.authRetryUsed) {
+      this.dropConnection(
+        `auth-required again after stored-challenge retry (${reason})`,
+      );
+      return;
+    }
+    this.authRetryUsed = true;
+    this.log.warn("auth-required; re-AUTHing with stored challenge", {
+      reason,
+    });
+    let res: OkResult;
+    try {
+      res = await this.sendAuth(challenge);
+    } catch (err) {
+      this.log.warn("stored-challenge re-AUTH failed to send", {
+        error: (err as Error).message,
+      });
+      return;
+    }
+    if (res.ok) {
+      this.log.info("stored-challenge re-AUTH accepted");
+      return;
+    }
+    if (isVerificationFailed(res.message)) {
+      this.onVerificationFailed(res.message);
+      return;
+    }
+    this.dropConnection(`stored-challenge re-AUTH rejected: ${res.message}`);
+  }
+
+  // -- publish queue --------------------------------------------------------
+
+  private async pump(): Promise<void> {
+    if (this.pumping) return;
+    this.pumping = true;
+    try {
+      while (
+        this.queue.length > 0 &&
+        this.status !== "closed" &&
+        !this.fatalError
+      ) {
+        try {
+          await this.waitReady();
+        } catch {
+          return; // closed or fatal; failEverything already settled the queue
+        }
+        await this.waitForResume();
+        const wait = this.bucket.tryConsume();
+        if (wait > 0) {
+          await this.delayRaw(wait);
+          continue;
+        }
+        const item = this.queue[0];
+        if (!item) continue;
+
+        let res: OkResult;
+        try {
+          item.sends += 1;
+          res = await this.awaitOk(item.event.id, item.frame);
+        } catch (err) {
+          if (err instanceof DisconnectedError) {
+            // Item stays queued; retried after reconnect (never dropped).
+            continue;
+          }
+          this.dequeue(item);
+          item.reject(err as Error);
+          continue;
+        }
+
+        if (res.ok) {
+          this.dequeue(item);
+          item.resolve(res);
+          continue;
+        }
+        const action = await this.handleOkFailure(item, res);
+        if (action === "settled") this.dequeue(item);
+      }
+    } finally {
+      this.pumping = false;
+      if (
+        this.queue.length > 0 &&
+        this.status === "ready" &&
+        !this.fatalError
+      ) {
+        void this.pump();
+      }
+    }
+  }
+
+  private dequeue(item: QueueItem): void {
+    const idx = this.queue.indexOf(item);
+    if (idx >= 0) this.queue.splice(idx, 1);
+  }
+
+  /** The OK-false matrix from the spec's Error handling table. */
+  private async handleOkFailure(
+    item: QueueItem,
+    res: OkResult,
+  ): Promise<"settled" | "retry"> {
+    const msg = res.message;
+
+    // auth-required: verification failed → backoff-retry, then fatal.
+    if (isVerificationFailed(msg)) {
+      this.onVerificationFailed(msg);
+      return this.fatalError ? "settled" : "retry";
+    }
+
+    // auth-required: (generic) → stored-challenge re-AUTH once, else reconnect.
+    if (msg.startsWith(P.authRequired)) {
+      await this.reauthOnce(msg);
+      return this.fatalError ? "settled" : "retry";
+    }
+
+    // restricted: not a relay member → fatal with guidance.
+    if (msg.startsWith(P.notRelayMember)) {
+      this.fatal(
+        `publish rejected: ${msg}`,
+        "NIP-43 relay membership is required. Run: `buzz-admin add-member <npub>` (NOSTR.md:210-297).",
+        msg,
+      );
+      return "settled";
+    }
+
+    // restricted: not a channel member → kind:9021 join once, retry, then fatal.
+    if (msg.startsWith(P.notChannelMember)) {
+      if (!item.joinAttempted && this.hooks.onNotChannelMember) {
+        item.joinAttempted = true;
+        const joined = await this.hooks
+          .onNotChannelMember()
+          .catch((err: unknown) => {
+            this.log.error("channel join hook threw", {
+              error: (err as Error).message,
+            });
+            return false;
+          });
+        if (joined) return "retry";
+      }
+      this.fatal(
+        `publish rejected: ${msg}`,
+        "The bridge is not a member of the Services channel and the kind:9021 join did not take. Check the channel's visibility and membership.",
+        msg,
+      );
+      return "settled";
+    }
+
+    // restricted: channel is private → fatal, the bridge will not force in.
+    if (msg.startsWith(P.channelPrivate)) {
+      this.fatal(
+        `publish rejected: ${msg}`,
+        "The Services channel was re-created as private. Re-create it as `visibility=open` or add the bridge as a channel member.",
+        msg,
+      );
+      return "settled";
+    }
+
+    // duplicate: … (incl. `duplicate: channel already exists`) → caller decides.
+    if (msg.startsWith(P.duplicate)) {
+      this.log.info("publish returned duplicate; passing through to caller", {
+        eventId: item.event.id,
+        kind: item.event.kind,
+        message: msg,
+      });
+      return this.settle(item, res);
+    }
+
+    // invalid: channel not found → clear channelId / re-run ChannelManager (§3).
+    if (msg.startsWith(P.channelNotFound)) {
+      this.log.warn("channel not found; signalling channelLost", {
+        eventId: item.event.id,
+        kind: item.event.kind,
+      });
+      this.emit("channelLost");
+      try {
+        await this.hooks.onChannelLost?.();
+      } catch (err) {
+        this.log.error("channelLost hook threw", {
+          error: (err as Error).message,
+        });
+      }
+      return this.settle(item, res);
+    }
+
+    // rate-limited: … → pause the queue, never drop the message.
+    if (msg.startsWith(P.rateLimited)) {
+      const seconds = parseRetryInSeconds(msg);
+      const pauseMs = seconds !== null ? seconds * 1_000 : CONCURRENT_RETRY_MS;
+      this.log.warn("publish rate-limited; pausing queue", {
+        eventId: item.event.id,
+        pauseMs,
+        message: msg,
+      });
+      this.pauseQueue(pauseMs);
+      return "retry";
+    }
+
+    // restricted: (anything else) → not transient; drop with an error log.
+    if (msg.startsWith(P.restricted)) {
+      this.log.error("publish rejected (restricted); dropping message", {
+        message: msg,
+        event: item.event,
+      });
+      return this.settle(item, res);
+    }
+
+    // invalid: (anything else) → bug, not transient: log full event and drop.
+    if (msg.startsWith(P.invalid)) {
+      this.log.error("publish rejected (invalid); dropping message", {
+        message: msg,
+        event: item.event,
+      });
+      return this.settle(item, res);
+    }
+
+    this.log.error("publish rejected with unrecognized prefix; dropping", {
+      message: msg,
+      event: item.event,
+    });
+    return this.settle(item, res);
+  }
+
+  /** Remove the item from the queue *before* settling the caller's promise. */
+  private settle(item: QueueItem, res: OkResult): "settled" {
+    this.dequeue(item);
+    item.resolve(res);
+    return "settled";
+  }
+
+  private pauseQueue(ms: number): void {
+    const until = Date.now() + ms * this.timeScale;
+    this.resumeAt = Math.max(this.resumeAt, until);
+  }
+
+  private async waitForResume(): Promise<void> {
+    for (;;) {
+      const remaining = this.resumeAt - Date.now();
+      if (remaining <= 0) return;
+      await this.delayRaw(remaining);
+    }
+  }
+
+  private delay(ms: number): Promise<void> {
+    return this.delayRaw(ms * this.timeScale);
+  }
+
+  private delayRaw(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)));
+  }
+
+  // -- fatal ---------------------------------------------------------------
+
+  private fatal(message: string, guidance: string, relayMessage: string): void {
+    if (this.fatalError) return;
+    const err = new BuzzFatalError(message, guidance, relayMessage);
+    this.fatalError = err;
+    this.log.error("fatal buzz condition; stopping", {
+      message,
+      guidance,
+      relayMessage,
+    });
+    this.status = "closed";
+    this.closeSocket();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.failEverything(err);
+    this.emit("fatal", err);
+    this.hooks.onFatal?.(err);
+  }
+
+  private failEverything(err: Error): void {
+    const settle = this.connectSettle;
+    this.connectSettle = null;
+    settle?.reject(err);
+
+    const waiters = this.readyWaiters;
+    this.readyWaiters = [];
+    for (const w of waiters) w.reject(err);
+
+    for (const [, p] of this.pending) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+    this.pending.clear();
+
+    const queued = this.queue.splice(0, this.queue.length);
+    for (const item of queued) item.reject(err);
+
+    for (const [, q] of this.queries) {
+      clearTimeout(q.timer);
+      q.reject(err);
+    }
+    this.queries.clear();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * All REQs must carry explicit `kinds` — omitting them trips the relay's
+ * p-gate 403 (spec §2; req.rs:1042).
+ */
+export function assertExplicitKinds(filters: NostrFilter[]): void {
+  if (filters.length === 0) throw new Error("REQ requires at least one filter");
+  for (const f of filters) {
+    if (!f.kinds || f.kinds.length === 0) {
+      throw new Error(
+        "every buzz REQ filter must carry explicit `kinds` (p-gate 403 otherwise)",
+      );
+    }
+  }
+}
+
+function isVerificationFailed(message: string): boolean {
+  return message.startsWith(P.verificationFailed);
+}
+
+function isNostrEvent(value: unknown): value is NostrEvent {
+  if (typeof value !== "object" || value === null) return false;
+  const e = value as Record<string, unknown>;
+  return (
+    typeof e["id"] === "string" &&
+    typeof e["pubkey"] === "string" &&
+    typeof e["kind"] === "number" &&
+    typeof e["content"] === "string" &&
+    typeof e["sig"] === "string" &&
+    Array.isArray(e["tags"])
+  );
 }
