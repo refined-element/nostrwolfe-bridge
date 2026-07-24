@@ -1490,4 +1490,120 @@ describe("MirrorEngine NIP-09 deletion (§3b)", () => {
       await h.engine.handleDeletion(simpleListing("svc", ["ai"], T0)),
     ).toEqual([]);
   });
+
+  it("a kind:5 arriving before its 38400 tombstones the address, suppressing a stale New card", async () => {
+    const h = harness();
+    const addr = `38400:${PK}:svc`;
+    // Hydration interleaves kinds newest-first, so the deletion (T0+60) can be
+    // delivered before the active 38400 (T0) it retracts.
+    const del = await h.engine.handleDeletion(deletionEvent(addr, T0 + 60));
+    expect(del).toEqual([]); // nothing on the channel to take down
+    expect(h.buzz.published).toHaveLength(0);
+    expect(h.state.state.mirrored[addr]!.delisted).toBe(true);
+
+    // The stale active 38400 must NOT post a "New service" card.
+    const outcome = await h.engine.handleListing(
+      simpleListing("svc", ["ai"], T0),
+    );
+    expect(outcome).toMatchObject({ type: "skip" });
+    expect(h.buzz.published).toHaveLength(0);
+    expect(h.cache.has(addr)).toBe(false);
+  });
+
+  it("a stale kind:5 older than the live listing does not take it down", async () => {
+    const h = harness();
+    const addr = `38400:${PK}:svc`;
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0 + 100));
+
+    const del = await h.engine.handleDeletion(deletionEvent(addr, T0 + 50));
+    expect(del).toEqual([]);
+    expect(h.buzz.contents.some((c) => c.startsWith("🐺 Removed:"))).toBe(
+      false,
+    );
+    expect(h.cache.has(addr)).toBe(true);
+    expect(h.state.state.mirrored[addr]!.delisted).toBe(false);
+  });
+
+  it("honors a deletion whose a-tag pubkey is uppercase hex (self-deletion)", async () => {
+    const h = harness();
+    const addr = `38400:${PK}:svc`;
+    await h.engine.handleListing(simpleListing("svc", ["ai"], T0));
+
+    // SK signs the deletion (its pubkey is PK, lowercase); the coordinate writes
+    // the pubkey uppercase — must still match and pass author binding.
+    const del = deletionEvent(`38400:${PK.toUpperCase()}:svc`, T0 + 60, SK);
+    const outcomes = await h.engine.handleDeletion(del);
+    expect(outcomes).toEqual([
+      { type: "removed", address: addr, cardMsgId: expect.any(String) },
+    ]);
+    expect(h.cache.has(addr)).toBe(false);
+  });
+
+  it("honors an e-tag deletion referencing the listing's event id (author-bound)", async () => {
+    const h = harness();
+    const addr = `38400:${PK}:svc`;
+    const listing = simpleListing("svc", ["ai"], T0);
+    await h.engine.handleListing(listing);
+
+    const del = finalizeEvent(
+      { kind: 5, created_at: T0 + 60, tags: [["e", listing.id]], content: "" },
+      SK,
+    ) as unknown as NostrEvent;
+    const outcomes = await h.engine.handleDeletion(del);
+    expect(outcomes).toEqual([
+      { type: "removed", address: addr, cardMsgId: expect.any(String) },
+    ]);
+    expect(h.cache.has(addr)).toBe(false);
+  });
+
+  it("ignores a cross-author e-tag deletion", async () => {
+    const h = harness();
+    const addr = `38400:${PK}:svc`;
+    const listing = simpleListing("svc", ["ai"], T0);
+    await h.engine.handleListing(listing);
+
+    // SK2 references SK's listing event id — not its author, must be ignored.
+    const del = finalizeEvent(
+      { kind: 5, created_at: T0 + 60, tags: [["e", listing.id]], content: "" },
+      SK2,
+    ) as unknown as NostrEvent;
+    expect(await h.engine.handleDeletion(del)).toEqual([]);
+    expect(h.cache.has(addr)).toBe(true);
+    expect(h.state.state.mirrored[addr]!.delisted).toBe(false);
+  });
+});
+
+describe("MirrorEngine expiration sweep (§3c)", () => {
+  const addr = `38400:${PK}:svc`;
+
+  it("takes down a listing that expires while mirrored", async () => {
+    let clock = T0 + 1000;
+    const h = harness({}, () => clock);
+    // Mirrored active: expiration is still in the future at T0+1000.
+    await h.engine.handleListing(expiringListing("svc", ["ai"], T0 + 2000, T0));
+    expect(h.cache.has(addr)).toBe(true);
+
+    // Clock advances past the expiration; the sweep takes it down.
+    clock = T0 + 3000;
+    const outcomes = await h.engine.sweepExpired();
+    expect(outcomes).toEqual([
+      { type: "expired", address: addr, cardMsgId: expect.any(String) },
+    ]);
+    expect(h.buzz.contents.at(-1)!.startsWith("🐺 Expired: svc")).toBe(true);
+    expect(h.cache.has(addr)).toBe(false);
+    expect(h.state.state.mirrored[addr]!.delisted).toBe(true);
+  });
+
+  it("is a no-op when nothing has expired, and idempotent once tombstoned", async () => {
+    let clock = T0 + 1000;
+    const h = harness({}, () => clock);
+    await h.engine.handleListing(expiringListing("svc", ["ai"], T0 + 2000, T0));
+
+    expect(await h.engine.sweepExpired()).toEqual([]); // not yet expired
+    clock = T0 + 3000;
+    expect(await h.engine.sweepExpired()).toHaveLength(1);
+    const after = h.buzz.published.length;
+    expect(await h.engine.sweepExpired()).toEqual([]); // already tombstoned
+    expect(h.buzz.published.length).toBe(after);
+  });
 });

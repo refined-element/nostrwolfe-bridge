@@ -166,7 +166,12 @@ export async function sweepStaleListings(
   deps.state.mutate((s) => {
     for (const { address } of stale) {
       const entry = s.mirrored[address];
-      if (entry && !entry.delisted) entry.staleNotified = true;
+      // Re-check under the mutation: skip anything that went inactive OR was
+      // refreshed (createdAt moved past the cutoff) during the publish await, so
+      // a listing that just refreshed isn't wrongly marked as already-reported.
+      if (entry && !entry.delisted && entry.createdAt < cutoff) {
+        entry.staleNotified = true;
+      }
     }
   });
   deps.log("info", "staleness digest posted", {

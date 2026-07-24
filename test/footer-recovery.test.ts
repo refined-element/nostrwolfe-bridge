@@ -356,9 +356,12 @@ describe("recoverMirroredFromChannel", () => {
 
     const mirrored = await recoverMirroredFromChannel(buzz, CHANNEL, BRIDGE);
 
+    // A tombstone recovers with its note's own created_at as the high-water mark
+    // (not 0), so a stale pre-removal 38400 replayed by hydration can't resurrect
+    // it as a live card (§3b).
     expect(mirrored[address]).toEqual({
       eventId: "",
-      createdAt: 0,
+      createdAt: 300,
       cardMsgId: "newest",
       delisted: true,
     });

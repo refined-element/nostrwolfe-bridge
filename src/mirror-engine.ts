@@ -248,8 +248,12 @@ export function parseAddressCoordinate(
   const i2 = coord.indexOf(":", i1 + 1);
   if (i2 < 0) return null;
   if (coord.slice(0, i1) !== String(LISTING_KIND)) return null;
-  const pubkey = coord.slice(i1 + 1, i2);
-  if (!HEX64.test(pubkey)) return null;
+  const rawPubkey = coord.slice(i1 + 1, i2);
+  if (!HEX64.test(rawPubkey)) return null;
+  // Normalize to lowercase so a coordinate written with uppercase hex still
+  // matches the (lowercase) mirrored address and passes author binding against
+  // the lowercase `event.pubkey` — otherwise a valid self-deletion is dropped.
+  const pubkey = rawPubkey.toLowerCase();
   const d = normalizeDKey(coord.slice(i2 + 1));
   if (d.length === 0) return null;
   return { pubkey, d, address: `${LISTING_KIND}:${pubkey}:${d}` };
@@ -792,8 +796,43 @@ export class MirrorEngine implements IMirrorEngine {
         parsed.address,
         parsed.pubkey,
         parsed.d,
+        event.created_at,
       );
       if (outcome) outcomes.push(outcome);
+    }
+
+    // NIP-09 also allows deletion by `e` tag (the 38400's event id). The `a`-tag
+    // form is spec-correct for addressable events, but heterogeneous third-party
+    // publishers do emit `e`-only deletions, and a dead card costs paying agents
+    // sats — so honor them too, matched against the stored `eventId` of a
+    // mirrored listing and bound to the same author (never a cross-author delete).
+    const eTagIds = new Set(
+      event.tags.filter((t) => t[0] === "e" && t[1]).map((t) => t[1] as string),
+    );
+    if (eTagIds.size > 0) {
+      const mirrored = this.state.getState().mirrored;
+      for (const [address, entry] of Object.entries(mirrored)) {
+        if (entry.delisted || acted.has(address)) continue;
+        if (entry.eventId === "" || !eTagIds.has(entry.eventId)) continue;
+        const parsed = parseAddressCoordinate(address);
+        if (parsed === null) continue;
+        if (parsed.pubkey !== event.pubkey) {
+          log(this.level, "warn", "ignoring cross-author e-tag deletion", {
+            deletionAuthor: event.pubkey,
+            listingPubkey: parsed.pubkey,
+            address,
+          });
+          continue;
+        }
+        acted.add(address);
+        const outcome = await this.applyDeletion(
+          parsed.address,
+          parsed.pubkey,
+          parsed.d,
+          event.created_at,
+        );
+        if (outcome) outcomes.push(outcome);
+      }
     }
 
     // Advance only after the whole event processed without a card rejection — a
@@ -804,31 +843,69 @@ export class MirrorEngine implements IMirrorEngine {
   }
 
   /**
-   * Take one mirrored-and-live address down in response to a deletion. Returns
-   * the "removed" outcome, or null when the address is unknown or already
-   * tombstoned (the idempotent no-op paths).
+   * Take an address down in response to a deletion, recording a durable removal
+   * **high-water mark** at the deletion's `created_at` (§3b, NIP-09 addressable
+   * semantics). Returns the "removed" outcome when a live card was taken down, or
+   * null for the no-card paths (idempotent no-op, stale deletion, or a deletion
+   * for an address never mirrored — which still records a tombstone).
+   *
+   * The high-water mark is what stops a stale active 38400 (one dated at or
+   * before the deletion) from resurfacing the listing as a "New"/"Updated" card,
+   * whether it arrives before its deletion during hydration (kinds are
+   * interleaved newest-first) or after a state-loss restart. Only a genuinely
+   * newer republish (`created_at` strictly after the deletion) restores it.
    */
   private async applyDeletion(
     address: string,
     pubkey: string,
     d: string,
+    deletionCreatedAt: number,
   ): Promise<MirrorOutcome | null> {
     const entry = this.state.getState().mirrored[address];
+
+    if (entry?.delisted) {
+      // Already paused/removed/expired/delisted — idempotent no-op (a replayed
+      // kind:5, or a kind:5 that follows a status:removed replacement). Still
+      // raise the tombstone's high-water mark if this deletion is newer.
+      if (deletionCreatedAt > entry.createdAt) {
+        this.state.mutate((s) => {
+          const e = s.mirrored[address];
+          if (e) e.createdAt = deletionCreatedAt;
+        });
+      }
+      return null;
+    }
+
     if (!entry) {
-      log(this.level, "debug", "deletion for un-mirrored address; ignoring", {
+      // Never mirrored (or pruned): there is no card to take down, but record a
+      // removal tombstone so a later stale 38400 for this address is suppressed
+      // rather than posted as a fresh "New" card.
+      this.state.mutate((s) => {
+        s.mirrored[address] ??= {
+          eventId: "",
+          createdAt: deletionCreatedAt,
+          cardMsgId: "",
+          delisted: true,
+        };
+        this.pruneTombstones(s.mirrored);
+      });
+      log(this.level, "debug", "deletion for un-mirrored address; tombstoned", {
         address,
       });
       return null;
     }
-    if (entry.delisted) {
-      // Already paused/removed/expired/delisted — idempotent no-op (a replayed
-      // kind:5, or a kind:5 that follows a status:removed replacement).
+
+    // NIP-09: a deletion applies only to versions at or before it. A stale kind:5
+    // older than the current live 38400 does not take it down.
+    if (deletionCreatedAt < entry.createdAt) {
       log(
         this.level,
         "debug",
-        "deletion for already-inactive address; ignoring",
+        "stale deletion older than live listing; ignoring",
         {
           address,
+          deletionCreatedAt,
+          entryCreatedAt: entry.createdAt,
         },
       );
       return null;
@@ -843,15 +920,16 @@ export class MirrorEngine implements IMirrorEngine {
     this.state.mutate((s) => {
       const e = s.mirrored[address];
       if (e) {
-        // Preserve the replace clock (eventId/createdAt of the last 38400) so a
-        // genuinely newer active republish can still restore the listing.
         e.delisted = true;
         e.cardMsgId = cardMsgId;
+        // High-water mark: only a republish strictly newer than the deletion may
+        // restore the listing (deletionCreatedAt >= e.createdAt here).
+        e.createdAt = deletionCreatedAt;
         delete e.staleNotified;
       } else {
         s.mirrored[address] = {
           eventId: "",
-          createdAt: 0,
+          createdAt: deletionCreatedAt,
           cardMsgId,
           delisted: true,
         };
@@ -861,6 +939,60 @@ export class MirrorEngine implements IMirrorEngine {
     });
     this.cache.delete(address);
     return { type: "removed", address, cardMsgId };
+  }
+
+  /**
+   * Take down every mirrored listing whose NIP-40 `expiration` has passed (§3c).
+   *
+   * `availability()` only sees a listing's expiration when a 38400 arrives, so a
+   * listing that expires *while mirrored* would otherwise keep a live card and a
+   * cache entry indefinitely. This sweep — run on the daily timer — closes that
+   * window: it posts an "Expired" note, tombstones the entry, and drops it from
+   * the search cache. Idempotent (already-tombstoned entries are skipped) and
+   * resilient (a rejected card is retried on the next sweep, not fatal).
+   */
+  async sweepExpired(): Promise<MirrorOutcome[]> {
+    const now = this.now();
+    const outcomes: MirrorOutcome[] = [];
+    // cache.all() is a snapshot, so deleting during the loop is safe.
+    for (const listing of this.cache.all()) {
+      if (listing.expiration === undefined || listing.expiration > now)
+        continue;
+
+      const entry = this.state.getState().mirrored[listing.address];
+      if (entry?.delisted) {
+        // Already down; just make sure it isn't lingering in the search cache.
+        this.cache.delete(listing.address);
+        continue;
+      }
+
+      try {
+        const cardMsgId = await this.postCard(listing, "expired");
+        this.record(listing, cardMsgId, true);
+        this.cache.delete(listing.address);
+        outcomes.push({ type: "expired", address: listing.address, cardMsgId });
+      } catch (err) {
+        if (err instanceof CardPublishError) {
+          log(
+            this.level,
+            "warn",
+            "expired card rejected; retrying next sweep",
+            {
+              address: listing.address,
+              message: err.result.message,
+            },
+          );
+          continue;
+        }
+        throw err;
+      }
+    }
+    if (outcomes.length > 0) {
+      log(this.level, "info", "expiration sweep tombstoned listings", {
+        count: outcomes.length,
+      });
+    }
+    return outcomes;
   }
 
   /** The §5 decision table proper. Throws if the card publish is rejected. */

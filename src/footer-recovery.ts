@@ -131,14 +131,19 @@ export async function recoverMirroredFromChannel(
       if (previous !== undefined && previous >= event.created_at) continue;
       winnerAt.set(footer.address, event.created_at);
 
+      const tombstone = isTombstoneKind(footer.cardKind);
       const entry: MirroredEntry = {
         // The card carries no source event id; recovery only needs the address.
         eventId: "",
-        // createdAt unknown → 0, so the next 38400 for this address posts an
-        // "updated" card rather than a duplicate "new" card (§7).
-        createdAt: 0,
+        // For an ACTIVE card, createdAt is unknown → 0, so the next 38400 for the
+        // address posts an "updated" card rather than a duplicate "new" card (§7).
+        // For a TOMBSTONE (removed/paused/expired/delisted), seed the high-water
+        // mark from the note's own timestamp — it is >= the removal, so a stale
+        // pre-removal 38400 replayed by hydration can't resurrect the listing as a
+        // live card; only a genuinely newer republish restores it (§3b).
+        createdAt: tombstone ? event.created_at : 0,
         cardMsgId: footer.cardMsgId,
-        delisted: isTombstoneKind(footer.cardKind),
+        delisted: tombstone,
       };
       mirrored[footer.address] = entry;
     }

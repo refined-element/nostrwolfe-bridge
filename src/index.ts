@@ -606,6 +606,9 @@ export async function startBridge(
   const runStaleSweep = async (): Promise<void> => {
     if (stopped) return;
     try {
+      // NIP-40 expiry first (§3c): take down anything that expired while
+      // mirrored, so the staleness digest below never counts an expired listing.
+      await mirror.sweepExpired();
       await sweepStaleListings({
         state,
         buzz,

@@ -429,6 +429,12 @@ export interface IMirrorEngine {
    * outcome per address acted on (empty when nothing matched).
    */
   handleDeletion(event: NostrEvent): Promise<MirrorOutcome[]>;
+  /**
+   * Take down every mirrored listing whose NIP-40 `expiration` has passed (§3c),
+   * posting an "Expired" note and dropping it from the search cache. Run on a
+   * timer, since expiration is otherwise only evaluated at 38400-arrival time.
+   */
+  sweepExpired(): Promise<MirrorOutcome[]>;
 }
 
 /**

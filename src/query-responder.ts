@@ -459,8 +459,16 @@ export class QueryResponder implements IQueryResponder {
   search(query: string): SearchResult[] {
     const terms = tokenize(query);
     if (terms.length === 0) return [];
+    // Defense in depth for NIP-40 expiry (§3c/§4): the expiration sweep runs on a
+    // daily timer, so between a listing's expiration and the next sweep it may
+    // still sit in the cache. Never return an expired listing from `find` — a
+    // paying agent must not be handed a dead endpoint.
+    const nowSec = Math.floor(this.now() / 1000);
     const scored: { result: SearchResult; listing: ParsedListing }[] = [];
     for (const listing of this.cache.all()) {
+      if (listing.expiration !== undefined && listing.expiration <= nowSec) {
+        continue;
+      }
       const score = scoreListing(listing, terms);
       if (score <= 0) continue;
       scored.push({
