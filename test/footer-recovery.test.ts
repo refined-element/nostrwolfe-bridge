@@ -132,6 +132,22 @@ describe("parseCardFooter", () => {
     });
   });
 
+  it("recognizes the lifecycle headers and recovers them as tombstones (§3a-c)", () => {
+    const p = hex(2);
+    for (const [header, kind] of [
+      ["🐺 Paused:", "paused"],
+      ["🐺 Removed:", "removed"],
+      ["🐺 Expired:", "expired"],
+    ] as const) {
+      const note = [`${header} svc`, "─", `nw:38400:${p}:svc`].join("\n");
+      expect(parseCardFooter({ id: `m-${kind}`, content: note })).toEqual({
+        address: `38400:${p}:svc`,
+        cardMsgId: `m-${kind}`,
+        cardKind: kind,
+      });
+    }
+  });
+
   it("rejects malformed footers", () => {
     const good = "abcdef01".repeat(8); // contains letters, so casing matters
     const cases = [
@@ -340,9 +356,12 @@ describe("recoverMirroredFromChannel", () => {
 
     const mirrored = await recoverMirroredFromChannel(buzz, CHANNEL, BRIDGE);
 
+    // A tombstone recovers with its note's own created_at as the high-water mark
+    // (not 0), so a stale pre-removal 38400 replayed by hydration can't resurrect
+    // it as a live card (§3b).
     expect(mirrored[address]).toEqual({
       eventId: "",
-      createdAt: 0,
+      createdAt: 300,
       cardMsgId: "newest",
       delisted: true,
     });

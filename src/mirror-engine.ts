@@ -6,7 +6,7 @@ import { npubEncode, decode as nip19Decode } from "nostr-tools/nip19";
 import { FrameTooLargeError } from "./buzz-client.js";
 import { normalizeDialect } from "./dialect.js";
 import {
-  CARD_HEADER_PREFIXES,
+  CARD_HEADERS_BY_KIND,
   CARD_SEPARATOR,
   sanitizeContent,
   sanitizeField,
@@ -40,6 +40,9 @@ import type {
 
 /** Kind of a NostrWolfe capability advertisement. */
 export const LISTING_KIND = 38400;
+
+/** Kind of a NIP-09 deletion request (§3b). */
+export const DELETION_KIND = 5;
 
 /** Kind of a Buzz chat message (the card carrier). */
 const CHAT_KIND = 9;
@@ -79,15 +82,17 @@ export const RENDER_MAX = {
 const DECIMAL_AMOUNT = /^\d+(\.\d+)?$/;
 
 /**
- * Card headers. The footer parser (§7) keys off these exact strings, and the
- * chrome-rejection filter in {@link sanitizeContent} keys off the same prefixes
- * — both are derived from the one shared constant so they cannot drift.
+ * Card headers (header prefix + a trailing space before the `d`). The footer
+ * parser (§7) keys off these exact prefixes, and the chrome-rejection filter in
+ * {@link sanitizeContent} keys off the same set — both are derived from the one
+ * shared {@link CARD_HEADERS_BY_KIND} map so they cannot drift.
  */
-const HEADERS: Record<CardKind, string> = {
-  new: `${CARD_HEADER_PREFIXES[0]} `,
-  updated: `${CARD_HEADER_PREFIXES[1]} `,
-  delisted: `${CARD_HEADER_PREFIXES[2]} `,
-};
+const HEADERS = Object.fromEntries(
+  Object.entries(CARD_HEADERS_BY_KIND).map(([kind, prefix]) => [
+    kind,
+    `${prefix} `,
+  ]),
+) as Record<CardKind, string>;
 
 // ---------------------------------------------------------------------------
 // Logging (plain stdout JSON lines, spec §1 LOG_LEVEL)
@@ -223,6 +228,37 @@ export function addressOf(event: NostrEvent): string | null {
   return `${LISTING_KIND}:${event.pubkey}:${d}`;
 }
 
+/** 64-hex Nostr pubkey. */
+const HEX64 = /^[0-9a-f]{64}$/i;
+
+/**
+ * Parse a NIP-09 `a`-tag coordinate `38400:<pubkey>:<d>` into its parts and the
+ * normalized mirror address (§3b). The `d` part may itself contain `:`, so only
+ * the first two separators are split. Returns null unless the kind is 38400, the
+ * pubkey is 64-hex, and `d` is non-empty after key-normalization — the same
+ * normalization {@link addressOf} applies, so the rebuilt address matches the
+ * mirrored key exactly.
+ */
+export function parseAddressCoordinate(
+  coord: string | undefined,
+): { pubkey: string; d: string; address: string } | null {
+  if (coord === undefined) return null;
+  const i1 = coord.indexOf(":");
+  if (i1 < 0) return null;
+  const i2 = coord.indexOf(":", i1 + 1);
+  if (i2 < 0) return null;
+  if (coord.slice(0, i1) !== String(LISTING_KIND)) return null;
+  const rawPubkey = coord.slice(i1 + 1, i2);
+  if (!HEX64.test(rawPubkey)) return null;
+  // Normalize to lowercase so a coordinate written with uppercase hex still
+  // matches the (lowercase) mirrored address and passes author binding against
+  // the lowercase `event.pubkey` — otherwise a valid self-deletion is dropped.
+  const pubkey = rawPubkey.toLowerCase();
+  const d = normalizeDKey(coord.slice(i2 + 1));
+  if (d.length === 0) return null;
+  return { pubkey, d, address: `${LISTING_KIND}:${pubkey}:${d}` };
+}
+
 /** Options for {@link parseListing}. */
 export interface ParseListingOptions {
   /**
@@ -332,6 +368,22 @@ function buildListing(
     ? parseNegotiable(negotiableTag)
     : ({ kind: "yes" } as const);
   if (negotiable) listing.negotiable = negotiable;
+
+  // NIP-A5 listing lifecycle (§3a). Only the two inactive states are recorded;
+  // an absent tag, `"active"`, or any unrecognized value leaves `status`
+  // undefined and the listing is treated as active — a typo must never silently
+  // hide a live listing.
+  const status = (firstTag(tags, "status")?.[1] ?? "").trim().toLowerCase();
+  if (status === "inactive") listing.status = "inactive";
+  else if (status === "removed") listing.status = "removed";
+
+  // NIP-40 expiration (§3c). Non-negative integer unix seconds; anything else is
+  // ignored (an unparseable expiration must not make a listing unavailable).
+  const expirationRaw = (firstTag(tags, "expiration")?.[1] ?? "").trim();
+  if (/^\d+$/.test(expirationRaw)) {
+    const expiration = Number(expirationRaw);
+    if (Number.isSafeInteger(expiration)) listing.expiration = expiration;
+  }
 
   return listing;
 }
@@ -471,25 +523,61 @@ export function formatNegotiable(n: Negotiable | undefined): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * The tombstone card kinds — those rendered as a bare note (header + separator +
+ * footer), dropped from the active cache. A category exit (`delisted`) and the
+ * three lifecycle-inactive states (§3a-c) all render identically.
+ */
+const TOMBSTONE_KINDS: ReadonlySet<CardKind> = new Set([
+  "delisted",
+  "paused",
+  "removed",
+  "expired",
+]);
+
+export function isTombstoneCardKind(kind: CardKind): boolean {
+  return TOMBSTONE_KINDS.has(kind);
+}
+
+/**
+ * A tombstone note: `header + separator + footer` only (§5 step 3, §3a-c).
+ *
+ * Takes `pubkey`/`d` directly rather than a {@link ParsedListing} so a NIP-09
+ * deletion (§3b) — which carries no listing fields, only the addressed
+ * coordinate — can render a "Removed" note from the address alone. The final
+ * line is the machine-readable footer `nw:38400:<pubkey>:<d>`, the sole recovery
+ * key (§7), so `d` is key-normalized before it reaches header or footer.
+ */
+export function formatTombstoneNote(
+  pubkey: string,
+  d: string,
+  kind: CardKind,
+): string {
+  const nd = normalizeDKey(d);
+  const footer = `nw:${LISTING_KIND}:${pubkey}:${nd}`;
+  return [`${HEADERS[kind]}${nd}`, SEPARATOR, footer].join("\n");
+}
+
+/**
  * Render a card body for the given listing and header kind (§5 step 4).
  *
  * Update cards are identical to new-listing cards in every field and line
- * except the header. Delisted notes carry only header + separator + footer.
- * The final line is always the machine-readable footer `nw:38400:<pubkey>:<d>`
- * — the sole recovery key (§7), which is why `d` is key-normalized (no
- * newlines) before it reaches either the header or the footer.
+ * except the header. Tombstone notes (delisted/paused/removed/expired) carry
+ * only header + separator + footer. The final line is always the
+ * machine-readable footer `nw:38400:<pubkey>:<d>` — the sole recovery key (§7),
+ * which is why `d` is key-normalized (no newlines) before it reaches either the
+ * header or the footer.
  */
 export function formatCard(listing: ParsedListing, kind: CardKind): string {
+  if (isTombstoneCardKind(kind)) {
+    return formatTombstoneNote(listing.pubkey, listing.d, kind);
+  }
+
   // `listing.d` is already the canonical key (parseListing → normalizeDKey);
   // re-normalizing is idempotent and keeps the footer byte-identical to
   // `listing.address`'s `d` part — the invariant footer recovery depends on (§7).
   const d = normalizeDKey(listing.d);
   const footer = `nw:${LISTING_KIND}:${listing.pubkey}:${d}`;
   const header = `${HEADERS[kind]}${d}`;
-
-  if (kind === "delisted") {
-    return [header, SEPARATOR, footer].join("\n");
-  }
 
   const categories =
     capJoin(
@@ -643,14 +731,291 @@ export class MirrorEngine implements IMirrorEngine {
     }
   }
 
+  /**
+   * Apply a NIP-09 kind:5 deletion (§3b). For each `["a","38400:<pubkey>:<d>"]`
+   * tag whose pubkey equals the deletion's author (author binding — never a
+   * cross-author take-down) and whose address is mirrored-and-live, post a
+   * "Removed" note, tombstone the entry, and drop it from the cache.
+   *
+   * Idempotent: a replayed kind:5, or one over an already-tombstoned address, is
+   * a no-op. Verifies the signature and future-clamps the timestamp before
+   * touching anything, exactly like {@link parseListing}, so a forged kind:5 can
+   * neither delete a listing nor poison the persisted cursor (Security §2, H-1).
+   */
+  async handleDeletion(event: NostrEvent): Promise<MirrorOutcome[]> {
+    if (event.kind !== DELETION_KIND) return [];
+
+    // Future-timestamp clamp (H-1): a forged far-future kind:5 must never push
+    // the persisted wolfe cursor past real time.
+    if (event.created_at > this.now() + CURSOR_SKEW) {
+      log(this.level, "debug", "dropped future-dated deletion", {
+        id: event.id,
+      });
+      return [];
+    }
+
+    // Re-verify a plain 7-field copy from scratch — the open relay is untrusted
+    // and nostr-tools caches an "already verified" marker that must be bypassed.
+    const plain = {
+      id: event.id,
+      pubkey: event.pubkey,
+      created_at: event.created_at,
+      kind: event.kind,
+      tags: event.tags,
+      content: event.content,
+      sig: event.sig,
+    };
+    if (!verifyEvent(plain as never)) {
+      log(this.level, "debug", "dropped deletion with bad signature", {
+        id: event.id,
+      });
+      return [];
+    }
+
+    const outcomes: MirrorOutcome[] = [];
+    const acted = new Set<string>();
+    for (const tag of event.tags) {
+      if (tag[0] !== "a") continue;
+      const parsed = parseAddressCoordinate(tag[1]);
+      if (parsed === null) continue;
+      // Author binding (mandatory): only the listing's own key may delete it.
+      // The address embeds the listing pubkey, so this is the whole check.
+      if (parsed.pubkey !== event.pubkey) {
+        log(this.level, "warn", "ignoring cross-author deletion", {
+          deletionAuthor: event.pubkey,
+          listingPubkey: parsed.pubkey,
+          address: parsed.address,
+        });
+        continue;
+      }
+      // One kind:5 may carry the same `a` twice; act at most once per address.
+      if (acted.has(parsed.address)) continue;
+      acted.add(parsed.address);
+
+      const outcome = await this.applyDeletion(
+        parsed.address,
+        parsed.pubkey,
+        parsed.d,
+        event.created_at,
+      );
+      if (outcome) outcomes.push(outcome);
+    }
+
+    // NIP-09 also allows deletion by `e` tag (the 38400's event id). The `a`-tag
+    // form is spec-correct for addressable events, but heterogeneous third-party
+    // publishers do emit `e`-only deletions, and a dead card costs paying agents
+    // sats — so honor them too, matched against the stored `eventId` of a
+    // mirrored listing and bound to the same author (never a cross-author delete).
+    const eTagIds = new Set(
+      event.tags.filter((t) => t[0] === "e" && t[1]).map((t) => t[1] as string),
+    );
+    if (eTagIds.size > 0) {
+      const mirrored = this.state.getState().mirrored;
+      for (const [address, entry] of Object.entries(mirrored)) {
+        if (entry.delisted || acted.has(address)) continue;
+        if (entry.eventId === "" || !eTagIds.has(entry.eventId)) continue;
+        const parsed = parseAddressCoordinate(address);
+        if (parsed === null) continue;
+        if (parsed.pubkey !== event.pubkey) {
+          log(this.level, "warn", "ignoring cross-author e-tag deletion", {
+            deletionAuthor: event.pubkey,
+            listingPubkey: parsed.pubkey,
+            address,
+          });
+          continue;
+        }
+        acted.add(address);
+        const outcome = await this.applyDeletion(
+          parsed.address,
+          parsed.pubkey,
+          parsed.d,
+          event.created_at,
+        );
+        if (outcome) outcomes.push(outcome);
+      }
+    }
+
+    // Advance only after the whole event processed without a card rejection — a
+    // thrown CardPublishError leaves the cursor parked so the kind:5 is
+    // redelivered and retried (already-tombstoned addresses are then no-ops).
+    this.advanceCursor(event.created_at);
+    return outcomes;
+  }
+
+  /**
+   * Take an address down in response to a deletion, recording a durable removal
+   * **high-water mark** at the deletion's `created_at` (§3b, NIP-09 addressable
+   * semantics). Returns the "removed" outcome when a live card was taken down, or
+   * null for the no-card paths (idempotent no-op, stale deletion, or a deletion
+   * for an address never mirrored — which still records a tombstone).
+   *
+   * The high-water mark is what stops a stale active 38400 (one dated at or
+   * before the deletion) from resurfacing the listing as a "New"/"Updated" card,
+   * whether it arrives before its deletion during hydration (kinds are
+   * interleaved newest-first) or after a state-loss restart. Only a genuinely
+   * newer republish (`created_at` strictly after the deletion) restores it.
+   */
+  private async applyDeletion(
+    address: string,
+    pubkey: string,
+    d: string,
+    deletionCreatedAt: number,
+  ): Promise<MirrorOutcome | null> {
+    const entry = this.state.getState().mirrored[address];
+
+    if (entry?.delisted) {
+      // Already paused/removed/expired/delisted — idempotent no-op (a replayed
+      // kind:5, or a kind:5 that follows a status:removed replacement). Still
+      // raise the tombstone's high-water mark if this deletion is newer.
+      if (deletionCreatedAt > entry.createdAt) {
+        this.state.mutate((s) => {
+          const e = s.mirrored[address];
+          if (e) e.createdAt = deletionCreatedAt;
+        });
+      }
+      return null;
+    }
+
+    if (!entry) {
+      // Never mirrored (or pruned): there is no card to take down, but record a
+      // removal tombstone so a later stale 38400 for this address is suppressed
+      // rather than posted as a fresh "New" card.
+      this.state.mutate((s) => {
+        s.mirrored[address] ??= {
+          eventId: "",
+          createdAt: deletionCreatedAt,
+          cardMsgId: "",
+          delisted: true,
+        };
+        this.pruneTombstones(s.mirrored);
+      });
+      log(this.level, "debug", "deletion for un-mirrored address; tombstoned", {
+        address,
+      });
+      return null;
+    }
+
+    // NIP-09: a deletion applies only to versions at or before it. A stale kind:5
+    // older than the current live 38400 does not take it down.
+    if (deletionCreatedAt < entry.createdAt) {
+      log(
+        this.level,
+        "debug",
+        "stale deletion older than live listing; ignoring",
+        {
+          address,
+          deletionCreatedAt,
+          entryCreatedAt: entry.createdAt,
+        },
+      );
+      return null;
+    }
+
+    const cardMsgId = await this.postTombstoneNote(
+      address,
+      pubkey,
+      d,
+      "removed",
+    );
+    this.state.mutate((s) => {
+      const e = s.mirrored[address];
+      if (e) {
+        e.delisted = true;
+        e.cardMsgId = cardMsgId;
+        // High-water mark: only a republish strictly newer than the deletion may
+        // restore the listing (deletionCreatedAt >= e.createdAt here).
+        e.createdAt = deletionCreatedAt;
+        delete e.staleNotified;
+      } else {
+        s.mirrored[address] = {
+          eventId: "",
+          createdAt: deletionCreatedAt,
+          cardMsgId,
+          delisted: true,
+        };
+      }
+      // Bound retained tombstones (M-1), same as the category-exit path.
+      this.pruneTombstones(s.mirrored);
+    });
+    this.cache.delete(address);
+    return { type: "removed", address, cardMsgId };
+  }
+
+  /**
+   * Take down every mirrored listing whose NIP-40 `expiration` has passed (§3c).
+   *
+   * `availability()` only sees a listing's expiration when a 38400 arrives, so a
+   * listing that expires *while mirrored* would otherwise keep a live card and a
+   * cache entry indefinitely. This sweep — run on the daily timer — closes that
+   * window: it posts an "Expired" note, tombstones the entry, and drops it from
+   * the search cache. Idempotent (already-tombstoned entries are skipped) and
+   * resilient (a rejected card is retried on the next sweep, not fatal).
+   */
+  async sweepExpired(): Promise<MirrorOutcome[]> {
+    const now = this.now();
+    const outcomes: MirrorOutcome[] = [];
+    // cache.all() is a snapshot, so deleting during the loop is safe.
+    for (const listing of this.cache.all()) {
+      if (listing.expiration === undefined || listing.expiration > now)
+        continue;
+
+      const entry = this.state.getState().mirrored[listing.address];
+      if (entry?.delisted) {
+        // Already down; just make sure it isn't lingering in the search cache.
+        this.cache.delete(listing.address);
+        continue;
+      }
+
+      try {
+        const cardMsgId = await this.postCard(listing, "expired");
+        this.record(listing, cardMsgId, true);
+        this.cache.delete(listing.address);
+        outcomes.push({ type: "expired", address: listing.address, cardMsgId });
+      } catch (err) {
+        if (err instanceof CardPublishError) {
+          log(
+            this.level,
+            "warn",
+            "expired card rejected; retrying next sweep",
+            {
+              address: listing.address,
+              message: err.result.message,
+            },
+          );
+          continue;
+        }
+        throw err;
+      }
+    }
+    if (outcomes.length > 0) {
+      log(this.level, "info", "expiration sweep tombstoned listings", {
+        count: outcomes.length,
+      });
+    }
+    return outcomes;
+  }
+
   /** The §5 decision table proper. Throws if the card publish is rejected. */
   private async decide(listing: ParsedListing): Promise<MirrorOutcome> {
     const { address } = listing;
     const matches = this.categoriesMatch(listing.s);
+    // §3a-c — availability from the `status` tag and NIP-40 `expiration`.
+    const availability = this.availability(listing);
     const entry = this.state.getState().mirrored[address];
 
     // Unknown address.
     if (!entry) {
+      if (availability !== "active") {
+        // Never mirrored while active, and it arrives already
+        // paused/removed/expired — there is nothing on the channel to take down,
+        // so post nothing (§3a-c). A NIP-33 replaceable relay only keeps the
+        // latest 38400, so a removed listing hydrates straight to this branch.
+        log(this.level, "debug", "ignoring never-seen inactive listing", {
+          address,
+          availability,
+        });
+        return { type: "skip", reason: "not-active", address };
+      }
       if (!matches) {
         log(this.level, "debug", "ignoring listing outside MIRROR_CATEGORIES", {
           address,
@@ -696,20 +1061,41 @@ export class MirrorEngine implements IMirrorEngine {
         // version matches the stored `created_at`). Without this the cache would
         // stay empty forever → `@bridge find` reports "0 listings cached" and
         // `mirroredCount`/`cache.size` never reach the cap (C-1 / H1).
-        this.cacheIfLive(listing, matches, entry);
+        this.cacheIfLive(listing, matches, entry, availability);
         return { type: "skip", reason: "duplicate", address };
       }
     } else {
       // Out-of-order replay: this event is OLDER than the stored current
       // version, so it may only *seed* an empty cache slot, never clobber a
       // newer entry already there (guarded inside cacheIfLive).
-      this.cacheIfLive(listing, matches, entry);
+      this.cacheIfLive(listing, matches, entry, availability);
       return { type: "skip", reason: "out-of-order", address };
     }
 
     if (!replaces) {
-      this.cacheIfLive(listing, matches, entry);
+      this.cacheIfLive(listing, matches, entry, availability);
       return { type: "skip", reason: "duplicate", address };
+    }
+
+    // §3a-c — a replacement that is paused/removed/expired takes the listing
+    // down. Reuses the delisted-tombstone machinery: dropped from the cache,
+    // retained in `mirrored` for dedupe, restored later by an active matching
+    // replacement.
+    if (availability !== "active") {
+      if (entry.delisted) {
+        // Already tombstoned — do NOT re-post a note. This makes the
+        // belt-and-suspenders removal idempotent (a `kind:5` and a
+        // `status:removed` replacement both land here) and stops repeated
+        // non-active replacements from spamming the channel. The clock still
+        // advances so the newest state wins.
+        this.record(listing, entry.cardMsgId, true);
+        this.cache.delete(address);
+        return { type: "skip", reason: "not-active", address };
+      }
+      const cardMsgId = await this.postCard(listing, availability);
+      this.record(listing, cardMsgId, true);
+      this.cache.delete(address);
+      return { type: availability, address, cardMsgId };
     }
 
     if (matches) {
@@ -729,8 +1115,26 @@ export class MirrorEngine implements IMirrorEngine {
   }
 
   /**
+   * Availability of a listing from its `status` tag and NIP-40 `expiration`
+   * (§3a-c). Expiration is terminal and checked first (a past `expiration`
+   * overrides any `status`); then explicit removal; then pause. Anything else —
+   * including an absent/`active`/unrecognized `status` — is active.
+   */
+  private availability(
+    listing: ParsedListing,
+  ): "active" | "paused" | "removed" | "expired" {
+    if (listing.expiration !== undefined && listing.expiration <= this.now()) {
+      return "expired";
+    }
+    if (listing.status === "removed") return "removed";
+    if (listing.status === "inactive") return "paused";
+    return "active";
+  }
+
+  /**
    * Put a listing into the search cache from a skip path iff it is *live* — its
-   * categories still match and its `mirrored` entry is not a delisted tombstone.
+   * categories still match, its `mirrored` entry is not a tombstone, and the
+   * listing itself is active (not paused/removed/expired, §3a-c).
    *
    * The event whose id equals the stored `eventId` is the canonical current
    * version, so it always (re)sets the slot. Any other event (a same-second
@@ -741,8 +1145,9 @@ export class MirrorEngine implements IMirrorEngine {
     listing: ParsedListing,
     matches: boolean,
     entry: MirroredEntry,
+    availability: "active" | "paused" | "removed" | "expired",
   ): void {
-    if (!matches || entry.delisted) return;
+    if (!matches || entry.delisted || availability !== "active") return;
     const isCanonical = listing.event.id === entry.eventId;
     if (isCanonical || !this.cache.has(listing.address)) {
       this.cache.set(listing.address, listing);
@@ -765,16 +1170,35 @@ export class MirrorEngine implements IMirrorEngine {
   }
 
   /**
-   * Drop the oldest delisted tombstones beyond {@link delistedBudget}. Only
-   * ever removes *delisted* entries, so dedupe of live listings is untouched; a
-   * pruned address that reappears simply posts a fresh "new" card.
+   * Drop delisted tombstones beyond {@link delistedBudget}. Only ever removes
+   * *delisted* entries, so dedupe of live listings is untouched; a pruned address
+   * that reappears simply posts a fresh "new" card.
+   *
+   * Eviction is **speculative-first**, not purely oldest-first. A "speculative"
+   * tombstone is one with no card on the channel (`cardMsgId === ""`): the
+   * removal high-water mark recorded when a kind:5 references an address the
+   * bridge never mirrored (§3b). Author binding constrains only the pubkey, not
+   * the `d`, so an attacker can mint many of these under their own key — and if
+   * eviction were purely oldest-first, a burst dated far in the future would
+   * evict every genuine (carded) removal high-water mark, re-opening the
+   * resurrection those marks exist to prevent. Evicting speculative tombstones
+   * before genuine ones (oldest-first within each class) means such a flood can
+   * only churn its own bucket; a real removal a viewer was shown is never
+   * evicted by it.
    */
   private pruneTombstones(mirrored: MirroredMap): void {
     const limit = this.delistedBudget();
     const tombstones = Object.entries(mirrored).filter(([, e]) => e.delisted);
     if (tombstones.length <= limit) return;
     tombstones
-      .sort((a, b) => a[1].createdAt - b[1].createdAt)
+      .sort((a, b) => {
+        // Speculative (no card) evicted before genuine (carded) removals…
+        const aSpec = a[1].cardMsgId === "" ? 0 : 1;
+        const bSpec = b[1].cardMsgId === "" ? 0 : 1;
+        if (aSpec !== bSpec) return aSpec - bSpec;
+        // …then oldest-first within each class.
+        return a[1].createdAt - b[1].createdAt;
+      })
       .slice(0, tombstones.length - limit)
       .forEach(([addr]) => {
         delete mirrored[addr];
@@ -793,12 +1217,39 @@ export class MirrorEngine implements IMirrorEngine {
     listing: ParsedListing,
     kind: CardKind,
   ): Promise<string> {
+    return this.publishCard(formatCard(listing, kind), listing.address, kind);
+  }
+
+  /**
+   * Post a tombstone note built from the address alone (§3b) — used by the
+   * NIP-09 deletion path, which has no {@link ParsedListing} to render, only the
+   * addressed coordinate.
+   */
+  private async postTombstoneNote(
+    address: string,
+    pubkey: string,
+    d: string,
+    kind: CardKind,
+  ): Promise<string> {
+    return this.publishCard(
+      formatTombstoneNote(pubkey, d, kind),
+      address,
+      kind,
+    );
+  }
+
+  /** Finalize a kind:9 card into the channel and return its id, or throw {@link CardPublishError}. */
+  private async publishCard(
+    content: string,
+    address: string,
+    kind: CardKind,
+  ): Promise<string> {
     const event = finalizeEvent(
       {
         kind: CHAT_KIND,
         created_at: Math.floor(Date.now() / 1000),
         tags: [["h", this.getChannelId()]],
-        content: formatCard(listing, kind),
+        content,
       },
       this.key(),
     ) as unknown as NostrEvent;
@@ -806,14 +1257,14 @@ export class MirrorEngine implements IMirrorEngine {
     const result = await this.buzz.publish(event);
     if (!result.ok) {
       log(this.level, "error", "card publish rejected", {
-        address: listing.address,
+        address,
         cardKind: kind,
         message: result.message,
       });
-      throw new CardPublishError(listing.address, result);
+      throw new CardPublishError(address, result);
     }
     log(this.level, "info", "card posted", {
-      address: listing.address,
+      address,
       cardKind: kind,
       cardMsgId: event.id,
     });

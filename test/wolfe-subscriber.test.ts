@@ -92,7 +92,7 @@ describe("WolfeSubscriber.hydrate (§4 startup hydration)", () => {
     const pages = relay.reqsForPrefix("wolfe-hydrate");
     expect(pages.length).toBeGreaterThan(1);
     // Every page carries the configured limit; only the first has no `until`.
-    expect(pages[0]!.filters[0]).toEqual({ kinds: [38400], limit: 100 });
+    expect(pages[0]!.filters[0]).toEqual({ kinds: [38400, 5], limit: 100 });
     for (const page of pages.slice(1)) {
       expect(page.filters[0]!.until).toBeTypeOf("number");
       expect(page.filters[0]!.limit).toBe(100);
@@ -292,7 +292,7 @@ describe("WolfeSubscriber.subscribeLive (§4 live subscription)", () => {
 
     await waitFor(() => relay!.reqsFor("wolfe-38400").length === 1);
     const filter = relay.reqsFor("wolfe-38400")[0]!.filters[0]!;
-    expect(filter).toEqual({ kinds: [38400], since: 4700 });
+    expect(filter).toEqual({ kinds: [38400, 5], since: 4700 });
     expect(filter.limit).toBeUndefined();
     // Category filtering is client-side only (§1) — never a server-side `#s`.
     expect(filter["#s"]).toBeUndefined();

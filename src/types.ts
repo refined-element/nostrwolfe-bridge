@@ -113,6 +113,11 @@ export interface Config {
   stateFile: string;
   /** LOG_LEVEL — pino-style level. */
   logLevel: LogLevel;
+  /**
+   * STALE_LISTING_DAYS — age (in days) past which an active mirrored listing is
+   * reported as stale by the daily staleness sweep (§3d). Default 30.
+   */
+  staleListingDays: number;
 }
 
 /** Resolved signing identity derived from `BRIDGE_NSEC`. Never logged or persisted. */
@@ -135,8 +140,22 @@ export interface MirroredEntry {
   createdAt: number;
   /** Message id of the last card posted for this address (kind:9). */
   cardMsgId: string;
-  /** True if the address is currently delisted (left the category allowlist). */
+  /**
+   * True when the address is **not in the active cache** — the tombstone flag.
+   * Set for a category exit (delisted) *and* for the lifecycle-inactive states
+   * (paused via `status:inactive`, removed via NIP-09/`status:removed`, expired
+   * via NIP-40). All four share the delisted-tombstone machinery: dropped from
+   * the search cache, retained here for dedupe, restored by a later active
+   * matching replacement. Cleared (a fresh entry) whenever an active card posts.
+   */
   delisted: boolean;
+  /**
+   * True once this address has been reported in a staleness digest (§3d), so a
+   * daily sweep announces each stale listing at most once. Reset (absent on the
+   * fresh entry) whenever an active `new`/`updated` card re-records the address,
+   * so a listing that refreshes and later goes stale again is re-reported.
+   */
+  staleNotified?: boolean;
 }
 
 /** Addressable-event key → dedupe metadata. Key is `38400:<pubkey>:<d>`. */
@@ -225,6 +244,18 @@ export interface ParsedListing {
   t: string[];
   /** `negotiable` tag, parsed. */
   negotiable?: Negotiable;
+  /**
+   * `status` tag (NIP-A5 listing lifecycle). One of `"active"`, `"inactive"`
+   * (paused), or `"removed"`. Absent tag → treated as `"active"` (the NIP's
+   * default). An unrecognized value is treated as `"active"` too, so a typo can
+   * never silently hide a live listing. Drives the availability decision (§5).
+   */
+  status?: "active" | "inactive" | "removed";
+  /**
+   * `expiration` tag (NIP-40), parsed to a unix timestamp (seconds). A listing
+   * whose `expiration` is in the past is treated as unavailable (§5/§3c).
+   */
+  expiration?: number;
   /** Provider content, plain-text (untrusted; sanitized at render time §5/§security). */
   content: string;
   /**
@@ -240,8 +271,15 @@ export interface ParsedListing {
 // Mirror decision (spec §5 decision table)
 // ---------------------------------------------------------------------------
 
-/** Which card header a mirror post carries. */
-export type CardKind = "new" | "updated" | "delisted";
+/**
+ * Which card header a mirror post carries.
+ *
+ * `new`/`updated` are active cards; `delisted`/`paused`/`removed`/`expired` are
+ * the tombstone notes (§5, §3a-c) — header + separator + footer only, dropped
+ * from the active cache.
+ */
+export type CardKind =
+  "new" | "updated" | "delisted" | "paused" | "removed" | "expired";
 
 /** Reason a 38400 produced no card (the "skip"/"ignore" rows of §5). */
 export type MirrorSkipReason =
@@ -254,17 +292,27 @@ export type MirrorSkipReason =
   /** Same `created_at`, id not lower than stored (not a lowest-id replacement). */
   | "duplicate"
   /** `created_at` older than stored (relay replay / out-of-order). */
-  | "out-of-order";
+  | "out-of-order"
+  /**
+   * A lifecycle-inactive listing (paused/removed/expired) that produced no new
+   * card: either an unknown address that was never mirrored while active, or an
+   * already-tombstoned address whose state was refreshed without re-posting
+   * (idempotent NIP-09 + `status:removed`, repeated non-active replacements).
+   */
+  | "not-active";
 
 /**
  * Outcome of {@link IMirrorEngine.handleListing}, as a discriminated union over
- * the §5 decision table. `new`/`update`/`delisted` each posted a card;
- * `skip` posted nothing and carries the reason.
+ * the §5 decision table. `new`/`update`/`delisted`/`paused`/`removed`/`expired`
+ * each posted a card; `skip` posted nothing and carries the reason.
  */
 export type MirrorOutcome =
   | { type: "new"; address: string; cardMsgId: string }
   | { type: "update"; address: string; cardMsgId: string }
   | { type: "delisted"; address: string; cardMsgId: string }
+  | { type: "paused"; address: string; cardMsgId: string }
+  | { type: "removed"; address: string; cardMsgId: string }
+  | { type: "expired"; address: string; cardMsgId: string }
   | { type: "skip"; reason: MirrorSkipReason; address?: string };
 
 // ---------------------------------------------------------------------------
@@ -372,6 +420,21 @@ export interface IWolfeSubscriber {
 export interface IMirrorEngine {
   /** Apply the §5 decision table to one incoming 38400 and return the outcome. */
   handleListing(event: NostrEvent): Promise<MirrorOutcome>;
+  /**
+   * Apply a NIP-09 kind:5 deletion (§3b). For each `["a","38400:<pubkey>:<d>"]`
+   * tag whose pubkey **matches the deletion's author** (no cross-author
+   * deletion) and whose address is currently mirrored-and-live, post a
+   * "Removed" note, drop it from the cache, and tombstone the entry. Idempotent:
+   * a replayed kind:5 over an already-removed address is a no-op. Returns one
+   * outcome per address acted on (empty when nothing matched).
+   */
+  handleDeletion(event: NostrEvent): Promise<MirrorOutcome[]>;
+  /**
+   * Take down every mirrored listing whose NIP-40 `expiration` has passed (§3c),
+   * posting an "Expired" note and dropping it from the search cache. Run on a
+   * timer, since expiration is otherwise only evaluated at 38400-arrival time.
+   */
+  sweepExpired(): Promise<MirrorOutcome[]>;
 }
 
 /**

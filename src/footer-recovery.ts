@@ -1,5 +1,6 @@
 /** Footer-based dedupe recovery from channel history (spec §7). */
 
+import { CARD_HEADERS_BY_KIND } from "./sanitize.js";
 import type {
   CardKind,
   IBuzzClient,
@@ -11,16 +12,26 @@ import type {
 } from "./types.js";
 
 /**
- * The three exact card headers (§5 step 4). A message is only considered a
+ * The exact card headers (§5 step 4, §3a-c). A message is only considered a
  * bridge card if its FIRST line starts with one of these — this is what keeps
  * QueryResponder replies (whose bodies also contain `nw:` strings) out of the
- * recovered dedupe set.
+ * recovered dedupe set. Derived from the one shared map so a new card kind is
+ * recognized on restart automatically (the staleness digest is deliberately
+ * absent: it carries no `nw:` footer and must never enter the dedupe set).
  */
-const CARD_HEADERS: ReadonlyArray<readonly [string, CardKind]> = [
-  ["🐺 New service:", "new"],
-  ["🐺 Updated:", "updated"],
-  ["🐺 Delisted:", "delisted"],
-];
+const CARD_HEADERS = Object.entries(CARD_HEADERS_BY_KIND) as ReadonlyArray<
+  readonly [CardKind, string]
+>;
+
+/**
+ * A card kind is a **tombstone** (dropped from the active cache, retained for
+ * dedupe) unless it is an active `new`/`updated` card. Recovering a paused,
+ * removed, or expired card as a live entry would re-post it as "new" on the next
+ * hydration, so all inactive kinds recover as `delisted: true` (§3a-c, §7).
+ */
+function isTombstoneKind(kind: CardKind): boolean {
+  return kind !== "new" && kind !== "updated";
+}
 
 /**
  * The machine-readable footer grammar (§7). Anchored on both ends: the whole
@@ -53,7 +64,7 @@ export function parseCardFooter(event: {
   if (first === undefined) return null;
 
   let cardKind: CardKind | undefined;
-  for (const [prefix, kind] of CARD_HEADERS) {
+  for (const [kind, prefix] of CARD_HEADERS) {
     if (first.startsWith(prefix)) {
       cardKind = kind;
       break;
@@ -120,14 +131,19 @@ export async function recoverMirroredFromChannel(
       if (previous !== undefined && previous >= event.created_at) continue;
       winnerAt.set(footer.address, event.created_at);
 
+      const tombstone = isTombstoneKind(footer.cardKind);
       const entry: MirroredEntry = {
         // The card carries no source event id; recovery only needs the address.
         eventId: "",
-        // createdAt unknown → 0, so the next 38400 for this address posts an
-        // "updated" card rather than a duplicate "new" card (§7).
-        createdAt: 0,
+        // For an ACTIVE card, createdAt is unknown → 0, so the next 38400 for the
+        // address posts an "updated" card rather than a duplicate "new" card (§7).
+        // For a TOMBSTONE (removed/paused/expired/delisted), seed the high-water
+        // mark from the note's own timestamp — it is >= the removal, so a stale
+        // pre-removal 38400 replayed by hydration can't resurrect the listing as a
+        // live card; only a genuinely newer republish restores it (§3b).
+        createdAt: tombstone ? event.created_at : 0,
         cardMsgId: footer.cardMsgId,
-        delisted: footer.cardKind === "delisted",
+        delisted: tombstone,
       };
       mirrored[footer.address] = entry;
     }

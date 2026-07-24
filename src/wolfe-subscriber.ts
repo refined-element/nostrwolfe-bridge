@@ -13,6 +13,17 @@ import type {
 /** Kind of a NostrWolfe capability advertisement. */
 const LISTING_KIND = 38400;
 
+/** Kind of a NIP-09 deletion request (§3b) — a listing take-down. */
+const DELETION_KIND = 5;
+
+/**
+ * Kinds the wolfe subscriptions watch: capability listings and their NIP-09
+ * deletions. The listener (index.ts) dispatches by kind — 38400 → mirror,
+ * kind:5 → deletion (§3b). Category filtering stays client-side (§1), so no
+ * server-side tag filter is added here.
+ */
+const WATCHED_KINDS = [LISTING_KIND, DELETION_KIND];
+
 /** Clock-skew allowance subtracted from the cursor for the live sub (§4). */
 const CURSOR_SKEW = 300;
 
@@ -173,7 +184,7 @@ export class WolfeSubscriber implements IWolfeSubscriber {
     try {
       for (; page < this.maxPages; page++) {
         if (this.stopped) return;
-        const filter: NostrFilter = { kinds: [LISTING_KIND], limit };
+        const filter: NostrFilter = { kinds: WATCHED_KINDS, limit };
         // Deliberately no `since` — hydration is cursor-independent (§4).
         if (until !== undefined) filter.until = until;
 
@@ -203,14 +214,19 @@ export class WolfeSubscriber implements IWolfeSubscriber {
             await onListing(event);
             // §5: address the same way MirrorEngine does (sanitized `d`), so
             // the cap's fallback accounting measures the identical address set
-            // rather than a raw-`d` set that drifts from it (L-2).
-            const address = addressOf(event);
-            if (address !== null) addresses.add(address);
-            else noAddress++;
+            // rather than a raw-`d` set that drifts from it (L-2). Only 38400s
+            // carry an address; kind:5 deletions (§3b) are neither counted
+            // toward the cap nor toward the invalid-parse health ratio.
+            if (event.kind === LISTING_KIND) {
+              const address = addressOf(event);
+              if (address !== null) addresses.add(address);
+              else noAddress++;
+            }
           } catch (err) {
             listenerErrors++;
-            this.log("error", "hydration listener failed for 38400", {
+            this.log("error", "hydration listener failed", {
               id: event.id,
+              kind: event.kind,
               error: String(err),
             });
           }
@@ -342,7 +358,7 @@ export class WolfeSubscriber implements IWolfeSubscriber {
       }
       const since = Math.max(0, this.getCursor() - CURSOR_SKEW);
       this.liveSince = since;
-      this.send(["REQ", SUB_LIVE, { kinds: [LISTING_KIND], since }]);
+      this.send(["REQ", SUB_LIVE, { kinds: WATCHED_KINDS, since }]);
       // §4 backoff parity with BuzzClient: the attempt counter resets on a
       // *useful* connection (live REQ on the wire), not on mere TCP open —
       // otherwise a relay that accepts and immediately closes is hammered at
@@ -388,7 +404,7 @@ export class WolfeSubscriber implements IWolfeSubscriber {
 
     for (let page = 0; page < this.maxPages; page++) {
       if (this.stopped) return;
-      const filter: NostrFilter = { kinds: [LISTING_KIND], since, limit };
+      const filter: NostrFilter = { kinds: WATCHED_KINDS, since, limit };
       if (until !== undefined) filter.until = until;
 
       // Unique sub id per page (M-6), same rationale as hydrate.
@@ -562,7 +578,7 @@ export class WolfeSubscriber implements IWolfeSubscriber {
       try {
         const since = Math.max(0, this.getCursor() - CURSOR_SKEW);
         this.liveSince = since;
-        this.send(["REQ", SUB_LIVE, { kinds: [LISTING_KIND], since }]);
+        this.send(["REQ", SUB_LIVE, { kinds: WATCHED_KINDS, since }]);
       } catch {
         // The socket died under us; drop into the reconnect path.
         this.dropConnection();

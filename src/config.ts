@@ -19,6 +19,7 @@ export const CONFIG_DEFAULTS = {
   BUZZ_MSGS_PER_MIN: "30",
   STATE_FILE: "./bridge-state.json",
   LOG_LEVEL: "info",
+  STALE_LISTING_DAYS: "30",
 } as const;
 
 const LOG_LEVELS: readonly LogLevel[] = ["debug", "info", "warn", "error"];
@@ -250,6 +251,12 @@ export function validateConfig(env: NodeJS.ProcessEnv): ConfigValidation {
     },
   );
 
+  const staleListingDays = validatePositiveInt(
+    pick(env, "STALE_LISTING_DAYS"),
+    "STALE_LISTING_DAYS",
+    errors,
+  );
+
   const stateFile = pick(env, "STATE_FILE");
 
   const logLevelRaw = pick(env, "LOG_LEVEL").toLowerCase();
@@ -277,6 +284,7 @@ export function validateConfig(env: NodeJS.ProcessEnv): ConfigValidation {
       buzzMsgsPerMin,
       stateFile,
       logLevel: logLevelRaw as LogLevel,
+      staleListingDays,
     },
     errors: [],
   };

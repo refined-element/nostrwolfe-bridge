@@ -448,6 +448,21 @@ describe("find scoring (§6)", () => {
     expect(results.map((r) => r.score)).toEqual([3, 2, 1]);
   });
 
+  it("excludes an expired listing from find results (§3c/§4)", () => {
+    const { qr, cache } = ctx;
+    const live = listing({ d: "live", s: ["storage"] });
+    const expired = listing({
+      d: "expired",
+      s: ["storage"],
+      expiration: NOW_SEC - 100,
+    });
+    cache.set(live.address, live);
+    cache.set(expired.address, expired);
+    // Even while the expired listing still sits in the cache (before the daily
+    // sweep tombstones it), a paying agent's `find` must never see it.
+    expect(qr.search("storage").map((r) => r.d)).toEqual(["live"]);
+  });
+
   it("accumulates per-term scores across a multi-term query", () => {
     const { qr, cache } = ctx;
     const both = listing({ d: "both", s: ["storage", "backup"], t: [] });
