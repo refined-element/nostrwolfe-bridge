@@ -104,6 +104,7 @@ describe("validateConfig — defaults (spec §1 table)", () => {
       channelAbout:
         "NostrWolfe marketplace mirror — public agent service listings",
       mirrorCategories: [],
+      mirrorAcceptDialects: true,
       mirrorMaxListings: 200,
       backfillLimit: 100,
       buzzMsgsPerMin: 30,

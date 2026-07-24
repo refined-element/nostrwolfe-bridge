@@ -53,8 +53,11 @@ let parsed = 0;
 let rejected = 0;
 const rejects = [];
 
+const acceptDialects = process.env.MIRROR_ACCEPT_DIALECTS !== "false";
+console.log(`dialect adapter: ${acceptDialects ? "on" : "off"}\n`);
+
 for (const event of events) {
-  const listing = parseListing(event);
+  const listing = parseListing(event, { acceptDialects });
   if (listing === null) {
     rejected++;
     const d = event.tags.find((t) => t[0] === "d")?.[1] ?? "(no d)";

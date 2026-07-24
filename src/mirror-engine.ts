@@ -3,6 +3,8 @@
 import { finalizeEvent, verifyEvent } from "nostr-tools/pure";
 import { npubEncode, decode as nip19Decode } from "nostr-tools/nip19";
 
+import { normalizeDialect } from "./dialect.js";
+
 import type {
   CardKind,
   Config,
@@ -99,6 +101,12 @@ export const FIELD_MAX = {
   d: 200,
   url: 512,
   short: 64,
+  /**
+   * Free-form pricing text. Wider than `short` because real listings price in
+   * full sentences ("500 sats for ≤10 pages, +50 sats per additional page"),
+   * and truncating a price mid-clause misstates the cost.
+   */
+  price: 160,
 } as const;
 
 /** Strip control chars; collapse tabs to spaces. Keeps newlines. */
@@ -195,14 +203,128 @@ export function addressOf(event: NostrEvent): string | null {
   return `${LISTING_KIND}:${event.pubkey}:${d}`;
 }
 
+/** Options for {@link parseListing}. */
+export interface ParseListingOptions {
+  /**
+   * Fall back to the dialect adapter when a listing lacks the NIP's required
+   * tags (config `MIRROR_ACCEPT_DIALECTS`, default on). With this off the
+   * parser is strictly NIP-A5 and most of the live relay is dropped.
+   */
+  acceptDialects?: boolean;
+}
+
+/**
+ * Build a listing from an already-verified event's tags/content, or null when
+ * the NIP's required tags (`d`, ≥1 `s`, ≥1 `price`) are absent.
+ *
+ * Split out from {@link parseListing} so the same construction runs over raw
+ * tags and over dialect-normalized tags — the normalized path must not be a
+ * second, drifting implementation of the canonical one.
+ */
+function buildListing(
+  event: NostrEvent,
+  tags: NostrTag[],
+  content: string,
+  dialect: string | undefined,
+): ParsedListing | null {
+  // Normalize once, here: `listing.d`, `listing.address`, the card header and
+  // the card footer are all this one string, so the footer a recovery scan
+  // reads is always exactly the key the live path looks up (§7).
+  const d = sanitizeField(firstTag(tags, "d")?.[1], FIELD_MAX.d);
+  if (d.length === 0) return null;
+
+  const s = tagValues(tags, "s")
+    .map((t) => (t[1] ?? "").trim())
+    .filter((v) => v.length > 0);
+  if (s.length === 0) return null;
+
+  const prices: PriceTier[] = tagValues(tags, "price")
+    .filter((t) => t.length >= 2)
+    .map((t) => {
+      const tier: PriceTier = {
+        amount: (t[1] ?? "").trim(),
+        currency: (t[2] ?? "").trim(),
+      };
+      const freq = (t[3] ?? "").trim();
+      if (freq.length > 0) tier.frequency = freq;
+      // Slot 4 carries free-form pricing text the dialect adapter could not
+      // reduce to amount+currency; canonical `price` tags never set it.
+      const note = (t[4] ?? "").trim();
+      if (note.length > 0) tier.note = note;
+      return tier;
+    })
+    // A dialect tier with neither an amount nor a note says nothing.
+    .filter((tier) => tier.amount.length > 0 || tier.note !== undefined);
+  if (prices.length === 0) return null;
+
+  const listing: ParsedListing = {
+    event,
+    address: `${LISTING_KIND}:${event.pubkey}:${d}`,
+    pubkey: event.pubkey,
+    createdAt: event.created_at,
+    d,
+    s,
+    prices,
+    t: tagValues(tags, "t")
+      .map((tag) => (tag[1] ?? "").trim())
+      .filter((v) => v.length > 0),
+    content,
+  };
+  if (dialect !== undefined) listing.dialect = dialect;
+
+  const l402 = firstTag(tags, "l402")?.[1];
+  if (l402 !== undefined && l402.length > 0) listing.l402 = l402;
+
+  const endpointTag = firstTag(tags, "endpoint");
+  if (endpointTag && (endpointTag[1] ?? "").length > 0) {
+    const endpoint: EndpointInfo = { url: endpointTag[1] as string };
+    const method = (endpointTag[2] ?? "").trim();
+    if (method.length > 0) endpoint.method = method;
+    listing.endpoint = endpoint;
+  }
+
+  const schema = firstTag(tags, "schema")?.[1];
+  if (schema !== undefined && schema.length > 0) listing.schema = schema;
+
+  const capacityTag = firstTag(tags, "capacity");
+  if (capacityTag && (capacityTag[1] ?? "").length > 0) {
+    const unit = (capacityTag[2] ?? "").trim();
+    listing.capacity =
+      unit.length > 0
+        ? `${capacityTag[1] as string} ${unit}`
+        : (capacityTag[1] as string);
+  }
+
+  const uptime = firstTag(tags, "uptime")?.[1];
+  if (uptime !== undefined && uptime.length > 0) listing.uptime = uptime;
+
+  // NIP-ASA: "If the `negotiable` tag is omitted, agents SHOULD assume the
+  // price is negotiable (`true`)" — so an absent tag is materialized as `yes`
+  // here. A *present but unparseable* tag stays undefined and renders as `—`.
+  const negotiableTag = firstTag(tags, "negotiable");
+  const negotiable = negotiableTag
+    ? parseNegotiable(negotiableTag)
+    : ({ kind: "yes" } as const);
+  if (negotiable) listing.negotiable = negotiable;
+
+  return listing;
+}
+
 /**
  * Parse and validate a raw kind:38400 into a {@link ParsedListing} (§5 step 1-2).
  *
  * §5 step 1: `verifyEvent` (BIP-340) — never trust an open relay's contents —
  * plus the NIP's required tags: non-empty `d`, at least one `s`, and a `price`.
  * Returns null (caller drops + logs) on any failure.
+ *
+ * NIP-A5 is tried first and always wins; only a listing the NIP cannot parse is
+ * handed to the dialect adapter, so compliant publishers are never reinterpreted
+ * (see `dialect.ts` for why the fallback exists at all).
  */
-export function parseListing(event: NostrEvent): ParsedListing | null {
+export function parseListing(
+  event: NostrEvent,
+  options: ParseListingOptions = {},
+): ParsedListing | null {
   if (event.kind !== LISTING_KIND) return null;
   // Verify a plain 7-field copy: nostr-tools caches a "already verified" symbol
   // on event objects, and an object that carried it in would skip BIP-340
@@ -218,80 +340,20 @@ export function parseListing(event: NostrEvent): ParsedListing | null {
   };
   if (!verifyEvent(plain as never)) return null;
 
-  // Normalize once, here: `listing.d`, `listing.address`, the card header and
-  // the card footer are all this one string, so the footer a recovery scan
-  // reads is always exactly the key the live path looks up (§7).
-  const d = sanitizeField(firstTag(event.tags, "d")?.[1], FIELD_MAX.d);
-  if (d.length === 0) return null;
+  const canonical = buildListing(event, event.tags, event.content, undefined);
+  if (canonical !== null) return canonical;
 
-  const s = tagValues(event.tags, "s")
-    .map((t) => (t[1] ?? "").trim())
-    .filter((v) => v.length > 0);
-  if (s.length === 0) return null;
+  if (options.acceptDialects !== true) return null;
 
-  const prices: PriceTier[] = tagValues(event.tags, "price")
-    .filter((t) => t.length >= 2)
-    .map((t) => {
-      const tier: PriceTier = {
-        amount: (t[1] ?? "").trim(),
-        currency: (t[2] ?? "").trim(),
-      };
-      const freq = (t[3] ?? "").trim();
-      if (freq.length > 0) tier.frequency = freq;
-      return tier;
-    });
-  if (prices.length === 0) return null;
+  const normalized = normalizeDialect(event.tags, event.content);
+  if (normalized === null) return null;
 
-  const listing: ParsedListing = {
+  return buildListing(
     event,
-    address: `${LISTING_KIND}:${event.pubkey}:${d}`,
-    pubkey: event.pubkey,
-    createdAt: event.created_at,
-    d,
-    s,
-    prices,
-    t: tagValues(event.tags, "t")
-      .map((tag) => (tag[1] ?? "").trim())
-      .filter((v) => v.length > 0),
-    content: event.content,
-  };
-
-  const l402 = firstTag(event.tags, "l402")?.[1];
-  if (l402 !== undefined && l402.length > 0) listing.l402 = l402;
-
-  const endpointTag = firstTag(event.tags, "endpoint");
-  if (endpointTag && (endpointTag[1] ?? "").length > 0) {
-    const endpoint: EndpointInfo = { url: endpointTag[1] as string };
-    const method = (endpointTag[2] ?? "").trim();
-    if (method.length > 0) endpoint.method = method;
-    listing.endpoint = endpoint;
-  }
-
-  const schema = firstTag(event.tags, "schema")?.[1];
-  if (schema !== undefined && schema.length > 0) listing.schema = schema;
-
-  const capacityTag = firstTag(event.tags, "capacity");
-  if (capacityTag && (capacityTag[1] ?? "").length > 0) {
-    const unit = (capacityTag[2] ?? "").trim();
-    listing.capacity =
-      unit.length > 0
-        ? `${capacityTag[1] as string} ${unit}`
-        : (capacityTag[1] as string);
-  }
-
-  const uptime = firstTag(event.tags, "uptime")?.[1];
-  if (uptime !== undefined && uptime.length > 0) listing.uptime = uptime;
-
-  // NIP-ASA: "If the `negotiable` tag is omitted, agents SHOULD assume the
-  // price is negotiable (`true`)" — so an absent tag is materialized as `yes`
-  // here. A *present but unparseable* tag stays undefined and renders as `—`.
-  const negotiableTag = firstTag(event.tags, "negotiable");
-  const negotiable = negotiableTag
-    ? parseNegotiable(negotiableTag)
-    : ({ kind: "yes" } as const);
-  if (negotiable) listing.negotiable = negotiable;
-
-  return listing;
+    normalized.tags,
+    normalized.content,
+    normalized.dialect,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -302,8 +364,20 @@ function trimNumber(n: number): string {
   return String(Math.round(n * 100) / 100);
 }
 
-/** `50 sats per-request`; a non-numeric amount renders as `—` (Security §2). */
+/**
+ * `50 sats per-request`; a non-numeric amount renders as `—` (Security §2).
+ *
+ * A dialect tier may carry the publisher's own free-form pricing text in
+ * {@link PriceTier.note} ("500+ sats (dynamic, per-character)"). When present it
+ * is rendered verbatim — sanitized like any other untrusted field — in place of
+ * the structured form: the note is the complete statement, and pairing it with
+ * the extracted number produces redundant, misleading output like
+ * `500 sats (500+ sats (dynamic, per-character))`. The parsed amount stays on
+ * the listing for search and comparison; only the display prefers the original.
+ */
 export function formatPriceTier(tier: PriceTier): string {
+  const note = sanitizeField(tier.note, FIELD_MAX.price);
+  if (note.length > 0) return note;
   if (tier.amount.length === 0 || !Number.isFinite(Number(tier.amount)))
     return DASH;
   const parts = [sanitizeField(tier.amount, FIELD_MAX.short)];
@@ -400,6 +474,15 @@ export function formatCard(listing: ParsedListing, kind: CardKind): string {
     `Negotiable: ${formatNegotiable(listing.negotiable)}`,
   ];
 
+  // Provenance: a normalized listing must never look like a compliant one. The
+  // label goes in a field line rather than the header, because footer recovery
+  // (§7) matches headers exactly.
+  if (listing.dialect !== undefined) {
+    lines.push(
+      `Format: non-standard tags (${sanitizeField(listing.dialect, FIELD_MAX.short)}), normalized by bridge`,
+    );
+  }
+
   const content = sanitizeContent(listing.content);
   if (content.length > 0) lines.push(content);
 
@@ -467,7 +550,9 @@ export class MirrorEngine implements IMirrorEngine {
    */
   async handleListing(event: NostrEvent): Promise<MirrorOutcome> {
     // §5 step 1 — validate.
-    const listing = parseListing(event);
+    const listing = parseListing(event, {
+      acceptDialects: this.config.mirrorAcceptDialects,
+    });
     if (!listing) {
       log(this.level, "debug", "dropped invalid 38400", {
         id: event.id,

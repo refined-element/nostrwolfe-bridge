@@ -13,6 +13,7 @@ export const CONFIG_DEFAULTS = {
   BRIDGE_CHANNEL_ABOUT:
     "NostrWolfe marketplace mirror — public agent service listings",
   MIRROR_CATEGORIES: "",
+  MIRROR_ACCEPT_DIALECTS: "true",
   MIRROR_MAX_LISTINGS: "200",
   BACKFILL_LIMIT: "100",
   BUZZ_MSGS_PER_MIN: "30",
@@ -69,6 +70,21 @@ function validateRelayUrl(
     );
   }
   return value;
+}
+
+/**
+ * Strict boolean: only `true`/`false` (case-insensitive). A typo is an error
+ * rather than a silent falsy default, because this flag decides whether most of
+ * the live marketplace gets mirrored at all.
+ */
+function validateBool(value: string, name: string, errors: string[]): boolean {
+  const v = value.trim().toLowerCase();
+  if (v === "true") return true;
+  if (v === "false") return false;
+  errors.push(
+    `${name}: must be "true" or "false" (got ${JSON.stringify(value)})`,
+  );
+  return false;
 }
 
 function validatePositiveInt(
@@ -208,6 +224,12 @@ export function validateConfig(env: NodeJS.ProcessEnv): ConfigValidation {
     env.MIRROR_CATEGORIES ?? CONFIG_DEFAULTS.MIRROR_CATEGORIES,
   );
 
+  const mirrorAcceptDialects = validateBool(
+    pick(env, "MIRROR_ACCEPT_DIALECTS"),
+    "MIRROR_ACCEPT_DIALECTS",
+    errors,
+  );
+
   const mirrorMaxListings = validatePositiveInt(
     pick(env, "MIRROR_MAX_LISTINGS"),
     "MIRROR_MAX_LISTINGS",
@@ -249,6 +271,7 @@ export function validateConfig(env: NodeJS.ProcessEnv): ConfigValidation {
       channelName,
       channelAbout,
       mirrorCategories,
+      mirrorAcceptDialects,
       mirrorMaxListings,
       backfillLimit,
       buzzMsgsPerMin,

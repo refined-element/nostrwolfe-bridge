@@ -17,6 +17,17 @@ The bridge needs a reachable Buzz relay. For local development, run `just relay`
 - `@bridge find <query>` — search mirrored listings by category, hashtag, or name.
 - `@bridge help` — usage.
 
+## Tag dialects
+
+Most listings on the live relay do not use NIP-A5 tags. A census of the public relay (`node scripts/dialect-census.mjs`) found 66 of 99 listings published with `category`/`subcategory`/`pricing` instead of `s`/`price`, by third-party operators. The bridge parses NIP-A5 first and always prefers it; only a listing the NIP cannot parse is handed to the adapter in `src/dialect.ts`, and anything it normalizes is labelled on its card so a reader can tell it apart from a compliant listing. Set `MIRROR_ACCEPT_DIALECTS=false` for strict NIP-A5 behavior.
+
+Coverage against the live relay, via `node scripts/smoke-wolfe.mjs`:
+
+| | listings mirrored |
+|---|---|
+| `MIRROR_ACCEPT_DIALECTS=false` | 32 of 99 |
+| `MIRROR_ACCEPT_DIALECTS=true` (default) | 98 of 99 |
+
 ## Design
 
 Full design spec, including the wire-level details and the decision tables this implementation follows:

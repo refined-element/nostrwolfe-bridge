@@ -97,6 +97,12 @@ export interface Config {
   channelAbout: string;
   /** MIRROR_CATEGORIES — parsed CSV; empty = all. Applied client-side in MirrorEngine (§5). */
   mirrorCategories: string[];
+  /**
+   * MIRROR_ACCEPT_DIALECTS — normalize listings that don't use NIP-A5 tags
+   * (see `dialect.ts`). Default true; false makes the parser strictly
+   * spec-compliant and drops most of the live relay.
+   */
+  mirrorAcceptDialects: boolean;
   /** MIRROR_MAX_LISTINGS — cap on distinct addresses tracked; overflow logged and skipped. */
   mirrorMaxListings: number;
   /** BACKFILL_LIMIT — page size (`limit`) for the paged strfry hydration REQ (§4). */
@@ -167,6 +173,13 @@ export interface PriceTier {
   currency: string;
   /** Optional billing frequency, e.g. `monthly`, `per-call`. */
   frequency?: string;
+  /**
+   * Free-form pricing text that could not be reduced to amount+currency, kept
+   * verbatim so a card can still say something true. Only ever set by the
+   * dialect adapter, whose sources price in prose ("Dynamic (varies by
+   * destination)"). Rendered instead of a numeric tier when `amount` is empty.
+   */
+  note?: string;
 }
 
 /** Endpoint metadata from an `["endpoint","<url>","<method>"]` tag. */
@@ -214,6 +227,13 @@ export interface ParsedListing {
   negotiable?: Negotiable;
   /** Provider content, plain-text (untrusted; sanitized at render time §5/§security). */
   content: string;
+  /**
+   * Set when the listing did not use NIP-A5 tags and was normalized by the
+   * dialect adapter — the short label of the dialect that matched. Absent for
+   * spec-compliant listings. Cards surface it so a reader can tell a normalized
+   * listing from a canonical one.
+   */
+  dialect?: string;
 }
 
 // ---------------------------------------------------------------------------
