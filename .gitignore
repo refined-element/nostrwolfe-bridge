@@ -3,3 +3,6 @@ dist
 .env
 bridge-state.json*
 *.tmp
+
+# review artifacts
+.reviews/
