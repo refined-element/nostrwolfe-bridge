@@ -467,12 +467,27 @@ export function formatPriceTier(tier: PriceTier): string {
   // `Number.isFinite(Number(x))` also accepts `0x10`, `1e3` and ` 5 `, so the
   // card and `find` disagreed on what counts as a price. Anything else → `—`.
   if (!DECIMAL_AMOUNT.test(tier.amount)) return DASH;
+  // A zero price reads as broken ("0 sats per-request"); say what it means.
+  if (Number(tier.amount) === 0) {
+    const freq = sanitizeField(tier.frequency, FIELD_MAX.short);
+    return freq.length > 0 ? `Free ${freq}` : "Free";
+  }
   const parts = [sanitizeField(tier.amount, FIELD_MAX.short)];
   const currency = sanitizeField(tier.currency, FIELD_MAX.short);
   if (currency.length > 0) parts.push(currency);
   const frequency = sanitizeField(tier.frequency, FIELD_MAX.short);
   if (frequency.length > 0) parts.push(frequency);
   return parts.join(" ");
+}
+
+/**
+ * Provider identity as a truncated npub — the full 63-char bech32 is a wall of
+ * text in a chat card. Middle-elided so both ends stay verifiable
+ * (`npub1abcd…xyz789`); short/odd values render whole.
+ */
+export function formatProvider(pubkey: string): string {
+  const npub = npubEncode(pubkey);
+  return npub.length > 24 ? `${npub.slice(0, 12)}…${npub.slice(-6)}` : npub;
 }
 
 /**
@@ -579,36 +594,48 @@ export function formatCard(listing: ParsedListing, kind: CardKind): string {
   const footer = `nw:${LISTING_KIND}:${listing.pubkey}:${d}`;
   const header = `${HEADERS[kind]}${d}`;
 
-  const categories =
-    capJoin(
-      listing.s
-        .map((v) => sanitizeField(v, FIELD_MAX.short))
-        .filter((v) => v.length > 0),
-      RENDER_MAX.categories,
-      ", ",
-    ) || DASH;
-  const hashtags =
-    capJoin(
-      listing.t
-        .map((tag) => sanitizeField(tag, FIELD_MAX.short))
-        .filter((v) => v.length > 0)
-        .map((v) => `#${v}`),
-      RENDER_MAX.hashtags,
-      " ",
-    ) || DASH;
+  const cats = listing.s
+    .map((v) => sanitizeField(v, FIELD_MAX.short))
+    .filter((v) => v.length > 0);
+  const categories = capJoin(cats, RENDER_MAX.categories, ", ") || DASH;
+
+  // Only show hashtags that add something beyond the categories — dialect
+  // listings routinely mirror every category as a tag, which just doubles the
+  // line. Drop the `Tags:` clause entirely when nothing distinct is left.
+  const catLower = new Set(cats.map((c) => c.toLowerCase()));
+  const distinctTags = listing.t
+    .map((tag) => sanitizeField(tag, FIELD_MAX.short))
+    .filter((v) => v.length > 0 && !catLower.has(v.toLowerCase()));
+  const tags = capJoin(
+    distinctTags.map((v) => `#${v}`),
+    RENDER_MAX.hashtags,
+    " ",
+  );
+
+  const lines = [header];
+
+  // Lead with the human-readable description (already sanitized) — it's the most
+  // useful line for a person or an LLM skimming the channel.
+  const content = sanitizeContent(listing.content);
+  if (content.length > 0) lines.push(content);
+
+  lines.push(
+    tags.length > 0
+      ? `Categories: ${categories}  ·  Tags: ${tags}`
+      : `Categories: ${categories}`,
+    `Price: ${formatPrices(listing.prices)}  ·  Negotiable: ${formatNegotiable(listing.negotiable)}`,
+    `Endpoint: ${formatEndpoint(listing)}`,
+  );
+
+  // Uptime/Capacity are self-reported and usually absent — omit the whole line
+  // rather than print `Uptime: — · Capacity: —`.
+  const uptime = formatUptime(listing.uptime);
   const capacity = listing.capacity
     ? sanitizeField(listing.capacity, FIELD_MAX.short)
     : DASH;
-
-  const lines = [
-    header,
-    `Provider: ${npubEncode(listing.pubkey)}`,
-    `Categories: ${categories}  •  Tags: ${hashtags}`,
-    `Price: ${formatPrices(listing.prices)}`,
-    `Endpoint: ${formatEndpoint(listing)}`,
-    `Uptime: ${formatUptime(listing.uptime)} · Capacity: ${capacity}`,
-    `Negotiable: ${formatNegotiable(listing.negotiable)}`,
-  ];
+  if (uptime !== DASH || capacity !== DASH) {
+    lines.push(`Uptime: ${uptime}  ·  Capacity: ${capacity}`);
+  }
 
   // Provenance: a normalized listing must never look like a compliant one. The
   // label goes in a field line rather than the header, because footer recovery
@@ -619,10 +646,7 @@ export function formatCard(listing: ParsedListing, kind: CardKind): string {
     );
   }
 
-  const content = sanitizeContent(listing.content);
-  if (content.length > 0) lines.push(content);
-
-  lines.push(SEPARATOR, footer);
+  lines.push(`Provider: ${formatProvider(listing.pubkey)}`, SEPARATOR, footer);
   return lines.join("\n");
 }
 
