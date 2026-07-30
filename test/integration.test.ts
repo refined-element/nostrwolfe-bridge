@@ -175,13 +175,12 @@ describe("nostrwolfe-bridge end-to-end", () => {
 
     const lines = card?.content.split("\n") ?? [];
     expect(lines[0]).toBe(`🐺 New service: ${D_TAG}`);
-    expect(lines[1]?.startsWith("Provider: npub1")).toBe(true);
-    expect(lines[2]).toBe("Categories: translation, nlp  •  Tags: #llm");
-    expect(lines[3]).toBe("Price: 100 sats per-request");
+    expect(lines[1]).toBe("Fast machine translation for agents.");
+    expect(lines[2]).toBe("Categories: translation, nlp  ·  Tags: #llm");
+    expect(lines[3]).toBe("Price: 100 sats per-request  ·  Negotiable: yes");
     expect(lines[4]).toBe("Endpoint: https://example.test/translate (POST)");
-    expect(lines[5]).toBe("Uptime: 99.7% · Capacity: 1000 req/day");
-    expect(lines[6]).toBe("Negotiable: yes");
-    expect(lines[7]).toBe("Fast machine translation for agents.");
+    expect(lines[5]).toBe("Uptime: 99.7%  ·  Capacity: 1000 req/day");
+    expect(lines[6]?.startsWith("Provider: npub1")).toBe(true);
     // The final line is the machine-readable footer — the recovery key (§7).
     expect(lines[lines.length - 1]).toBe(`nw:${ADDRESS}`);
 
@@ -213,7 +212,7 @@ describe("nostrwolfe-bridge end-to-end", () => {
     const card = cardsWithHeader(buzz, "🐺 Updated:")[0];
     const lines = card?.content.split("\n") ?? [];
     expect(lines[0]).toBe(`🐺 Updated: ${D_TAG}`);
-    expect(lines[3]).toBe("Price: 150 sats per-request");
+    expect(lines[3]).toBe("Price: 150 sats per-request  ·  Negotiable: yes");
     expect(lines[lines.length - 1]).toBe(`nw:${ADDRESS}`);
 
     // No second "new" card for an address already mirrored.
