@@ -612,20 +612,17 @@ export function formatCard(listing: ParsedListing, kind: CardKind): string {
     " ",
   );
 
-  const lines = [header];
-
-  // Lead with the human-readable description (already sanitized) — it's the most
-  // useful line for a person or an LLM skimming the channel.
-  const content = sanitizeContent(listing.content);
-  if (content.length > 0) lines.push(content);
-
-  lines.push(
+  // The card is assembled as blank-line-separated *sections* so it reads as a
+  // spaced block in the channel rather than a dense wall of text: title,
+  // description, details, then the machine-readable footer. Header stays line 0
+  // and the footer stays the last line — the two anchors footer recovery reads (§7).
+  const details = [
     tags.length > 0
       ? `Categories: ${categories}  ·  Tags: ${tags}`
       : `Categories: ${categories}`,
     `Price: ${formatPrices(listing.prices)}  ·  Negotiable: ${formatNegotiable(listing.negotiable)}`,
     `Endpoint: ${formatEndpoint(listing)}`,
-  );
+  ];
 
   // Uptime/Capacity are self-reported and usually absent — omit the whole line
   // rather than print `Uptime: — · Capacity: —`.
@@ -634,20 +631,31 @@ export function formatCard(listing: ParsedListing, kind: CardKind): string {
     ? sanitizeField(listing.capacity, FIELD_MAX.short)
     : DASH;
   if (uptime !== DASH || capacity !== DASH) {
-    lines.push(`Uptime: ${uptime}  ·  Capacity: ${capacity}`);
+    details.push(`Uptime: ${uptime}  ·  Capacity: ${capacity}`);
   }
 
   // Provenance: a normalized listing must never look like a compliant one. The
   // label goes in a field line rather than the header, because footer recovery
   // (§7) matches headers exactly.
   if (listing.dialect !== undefined) {
-    lines.push(
+    details.push(
       `Format: non-standard tags (${sanitizeField(listing.dialect, FIELD_MAX.short)}), normalized by bridge`,
     );
   }
 
-  lines.push(`Provider: ${formatProvider(listing.pubkey)}`, SEPARATOR, footer);
-  return lines.join("\n");
+  details.push(`Provider: ${formatProvider(listing.pubkey)}`);
+
+  const sections: string[][] = [[header]];
+
+  // Lead with the human-readable description (already sanitized) — it's the most
+  // useful line for a person or an LLM skimming the channel.
+  const content = sanitizeContent(listing.content);
+  if (content.length > 0) sections.push([content]);
+
+  sections.push(details, [SEPARATOR, footer]);
+
+  // Lines within a section join with "\n"; sections join with a blank line.
+  return sections.map((section) => section.join("\n")).join("\n\n");
 }
 
 // ---------------------------------------------------------------------------

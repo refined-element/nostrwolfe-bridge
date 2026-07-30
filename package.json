@@ -1,6 +1,6 @@
 {
   "name": "nostrwolfe-bridge",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A daemon that mirrors the NostrWolfe agent-services marketplace (Nostr kind:38400) into a Buzz community channel, and lets members publish their own listings out to it.",
   "type": "module",
   "license": "MIT",
