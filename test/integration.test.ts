@@ -175,7 +175,7 @@ describe("nostrwolfe-bridge end-to-end", () => {
 
     // Blank-line-separated sections: header, [blank], description, [blank], details…, [blank], ─, footer.
     const lines = card?.content.split("\n") ?? [];
-    expect(lines[0]).toBe(`🐺 New service: ${D_TAG}`);
+    expect(lines[0]).toBe(`🐺 New service: **${D_TAG}**`);
     expect(lines[1]).toBe("");
     expect(lines[2]).toBe("Fast machine translation for agents.");
     expect(lines[3]).toBe("");
@@ -214,7 +214,7 @@ describe("nostrwolfe-bridge end-to-end", () => {
     );
     const card = cardsWithHeader(buzz, "🐺 Updated:")[0];
     const lines = card?.content.split("\n") ?? [];
-    expect(lines[0]).toBe(`🐺 Updated: ${D_TAG}`);
+    expect(lines[0]).toBe(`🐺 Updated: **${D_TAG}**`);
     expect(lines[5]).toBe("Price: 150 sats per-request  ·  Negotiable: yes");
     expect(lines[lines.length - 1]).toBe(`nw:${ADDRESS}`);
 

@@ -235,7 +235,7 @@ describe("card rendering for normalized listings", () => {
     const listing = parseListing(event, { acceptDialects: true });
     const card = formatCard(listing!, "new");
 
-    expect(card.split("\n")[0]).toBe("🐺 New service: sats4ai-deblur-image");
+    expect(card.split("\n")[0]).toBe("🐺 New service: **sats4ai-deblur-image**");
     expect(card).toContain("Categories: ai, image-processing");
     expect(card).toContain("Price: 10 sats");
     expect(card).toContain(

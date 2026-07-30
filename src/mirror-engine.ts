@@ -94,6 +94,16 @@ const HEADERS = Object.fromEntries(
   ]),
 ) as Record<CardKind, string>;
 
+/**
+ * The card's first line: the kind prefix followed by the `d` in **bold** (Buzz
+ * renders markdown, so the service name stands out). Footer recovery (§7) keys
+ * off the *prefix* via `startsWith` and reads the address from the footer, so the
+ * bold markup around `d` is display-only and does not affect recovery.
+ */
+function formatCardHeader(kind: CardKind, d: string): string {
+  return `${HEADERS[kind]}**${d}**`;
+}
+
 // ---------------------------------------------------------------------------
 // Logging (plain stdout JSON lines, spec §1 LOG_LEVEL)
 // ---------------------------------------------------------------------------
@@ -569,7 +579,7 @@ export function formatTombstoneNote(
 ): string {
   const nd = normalizeDKey(d);
   const footer = `nw:${LISTING_KIND}:${pubkey}:${nd}`;
-  return [`${HEADERS[kind]}${nd}`, SEPARATOR, footer].join("\n");
+  return [formatCardHeader(kind, nd), SEPARATOR, footer].join("\n");
 }
 
 /**
@@ -592,7 +602,7 @@ export function formatCard(listing: ParsedListing, kind: CardKind): string {
   // `listing.address`'s `d` part — the invariant footer recovery depends on (§7).
   const d = normalizeDKey(listing.d);
   const footer = `nw:${LISTING_KIND}:${listing.pubkey}:${d}`;
-  const header = `${HEADERS[kind]}${d}`;
+  const header = formatCardHeader(kind, d);
 
   const cats = listing.s
     .map((v) => sanitizeField(v, FIELD_MAX.short))
